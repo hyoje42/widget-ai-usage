@@ -22,7 +22,9 @@ $source     = $PSScriptRoot
 $installDir = Join-Path $env:LOCALAPPDATA 'ai-usage-widget'
 $widget     = Join-Path $installDir 'ai-usage-widget.ps1'
 $startup    = [Environment]::GetFolderPath('Startup')
+$programs   = [Environment]::GetFolderPath('Programs')
 $shortcut   = Join-Path $startup 'AI Usage Widget.lnk'
+$menuLink   = Join-Path $programs 'AI Usage Widget.lnk'
 $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $launchArgs = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -STA -File "{0}"' -f $widget
 
@@ -44,16 +46,21 @@ foreach ($file in @('ai-usage-widget.ps1', 'uninstall.ps1')) {
     Write-Output "Copied:  $file"
 }
 
-# Startup shortcut (overwritten on every install so argument changes propagate).
+# Shortcuts (overwritten on every install so argument changes propagate):
+# one in Startup for auto-launch at login, one in the Start Menu so the
+# widget can be found by typing its name. Launching while it already runs
+# simply restarts it.
 $shell = New-Object -ComObject WScript.Shell
-$lnk = $shell.CreateShortcut($shortcut)
-$lnk.TargetPath = $powershell
-$lnk.Arguments = $launchArgs
-$lnk.WorkingDirectory = $installDir
-$lnk.WindowStyle = 7   # Minimized; the console is hidden by -WindowStyle Hidden anyway.
-$lnk.Description = 'AI Usage Widget (Claude Code / Codex remaining usage)'
-$lnk.Save()
-Write-Output "Startup: $shortcut"
+foreach ($path in @($shortcut, $menuLink)) {
+    $lnk = $shell.CreateShortcut($path)
+    $lnk.TargetPath = $powershell
+    $lnk.Arguments = $launchArgs
+    $lnk.WorkingDirectory = $installDir
+    $lnk.WindowStyle = 7   # Minimized; the console is hidden by -WindowStyle Hidden anyway.
+    $lnk.Description = 'AI Usage Widget (Claude Code / Codex remaining usage)'
+    $lnk.Save()
+    Write-Output "Shortcut: $path"
+}
 
 if (-not $NoStart) {
     Start-Process -FilePath $powershell -ArgumentList $launchArgs -WorkingDirectory $installDir -WindowStyle Hidden
