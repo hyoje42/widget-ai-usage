@@ -34,6 +34,7 @@ Windows 11 데스크톱에 항상 떠 있는 작은 위젯으로, Claude Code와
   항상 `-NoProfile` 을 붙이고, 출력은 `| tr -d '\r'` 로 정리합니다. 한글 오류 메시지는 코드페이지 때문에 깨져 보일 수 있습니다.
 - Windows → WSL 호출(`wsl.exe -d Ubuntu -u hyoje -- <cmd>`) 지연은 약 0.2초입니다.
 - 시작 프로그램 폴더: `C:\Users\user\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup`.
+  설치 스크립트는 여기와 시작 메뉴(`...\Programs`)에 같은 바로가기 `AI Usage Widget.lnk` 를 만듭니다.
 
 ## 4. 데이터 소스 (비공식 API)
 
@@ -60,6 +61,12 @@ Windows 11 데스크톱에 항상 떠 있는 작은 위젯으로, Claude Code와
 
 표시 값은 `100 - 사용%` 인 **남은 퍼센트** 입니다.
 
+### 로고
+- 헤더 로고는 SVG 경로 데이터를 스크립트 안에 내장하고 WPF `Path` 로 그립니다. 이미지 파일을 쓰지 않습니다.
+  - Claude: Simple Icons 의 `claude` 아이콘 (CC0 1.0), viewBox 0 0 24 24, 브랜드 색 `#D97757`.
+  - Codex: OpenAI 심볼 (Wikimedia Commons `ChatGPT-Logo.svg`, 단일 path, viewBox 0 0 320 320), 어두운 배경 위에 흰색.
+- 두 로고 모두 각 회사의 상표이며 개인용 위젯에서만 사용합니다. 색이나 형태를 변형하지 않습니다.
+
 ## 5. 보안과 개인정보 규칙 (필수)
 
 - 토큰 파일은 **읽기 전용**입니다. 어떤 경우에도 쓰거나 이동하거나 삭제하지 않습니다.
@@ -72,7 +79,7 @@ Windows 11 데스크톱에 항상 떠 있는 작은 위젯으로, Claude Code와
 
 - PowerShell 7 전용 문법 금지: 삼항 연산자 `? :`, null 병합 `??`, `ForEach-Object -Parallel`, `Get-Error`, `-SkipHttpErrorCheck` 등.
 - **한글이 들어가는 `.ps1` 파일은 반드시 UTF-8 with BOM 으로 저장**합니다. 5.1은 BOM 없는 UTF-8을 ANSI로 읽어 한글이 깨집니다.
-  WSL에서 파일을 쓸 때 BOM을 붙이는 것을 잊지 마십시오. 가능하면 위젯 UI 문자열은 영어로 유지해 이 문제를 피합니다.
+  WSL에서 파일을 쓸 때 BOM을 붙이는 것을 잊지 마십시오. 위젯 UI 문구는 한국어입니다.
 - WPF는 **STA 스레드** 가 필요하므로 실행 시 `-STA` 옵션을 붙입니다.
 - `Invoke-RestMethod` 에는 항상 `-TimeoutSec` 을 지정하고, 호출 전에 `[Net.ServicePointManager]::SecurityProtocol` 에 TLS 1.2를 포함시킵니다.
 - 타이머는 `System.Windows.Threading.DispatcherTimer` 를 사용합니다 (UI 스레드에서 안전).
@@ -82,13 +89,19 @@ Windows 11 데스크톱에 항상 떠 있는 작은 위젯으로, Claude Code와
 - `$ErrorActionPreference = 'Stop'` 상태에서 타이머 tick 이나 이벤트 처리기 안의 예외는 프로세스를 조용히 종료시킵니다.
   모든 처리기는 try/catch 로 감싸고 `Write-Log` 로 남기며, `Dispatcher.UnhandledException` 처리기를 마지막 안전망으로 둡니다.
 - `WS_EX_TOOLWINDOW` 를 적용한 창은 `Process.MainWindowTitle` 이 비어 있습니다. 실행 중 인스턴스 탐지는 `widget.pid` 를 기준으로 합니다.
+- `Window.DragMove()` 는 드래그가 끝날 때까지 블로킹되고 `MouseLeftButtonUp` 을 삼킵니다. 위치 저장은 `DragMove` 반환 직후에 합니다.
+- 자동 변수 `$host`, `$input`, `$args` 등을 지역 변수 이름으로 쓰지 않습니다.
+- `ai-usage-widget.ps1` 은 UI 문구가 한국어이므로 **UTF-8 BOM** 으로 저장되어 있습니다. Python 으로 편집할 때는
+  `encoding='utf-8-sig'` 로 읽고 쓰며, sed 등으로 편집한 뒤에는 `head -c3 | xxd` 로 BOM(`ef bb bf`)이 남아 있는지 확인합니다.
+- Hangul 폰트 폴백을 위해 FontFamily 는 `'Segoe UI, Malgun Gothic'` 으로 지정합니다.
 
 ## 7. 파일 구성과 배포 흐름
 
 ```
 ai-usage-widget.ps1   # 위젯 본체 (UI + 수집 + 갱신)
 install.ps1           # Windows 쪽 폴더로 복사, 시작 프로그램 바로가기 등록, 실행 중인 위젯 재시작
-uninstall.ps1         # 바로가기 제거, 위젯 종료 (선택)
+uninstall.ps1         # 바로가기 제거, 위젯 종료
+tools/capture-widget.ps1  # 개발용: 위젯 창을 PNG 로 캡처 (설치 대상 아님)
 AGENTS.md / CLAUDE.md # 이 지침
 ```
 
@@ -113,7 +126,14 @@ cd /mnt/c/Users/user && powershell.exe -NoProfile -ExecutionPolicy Bypass -File 
 ```
 
 - `-FetchOnly` 와 `-Stop` 스위치는 위젯 스크립트가 반드시 지원해야 합니다.
-- 화면 확인은 PowerShell 로 캡처해서 이미지를 읽습니다. 우측 하단 480x300 영역을 잘라 저장하는 예시입니다.
+- 화면 확인은 `tools/capture-widget.ps1` 로 **위젯 창 자체를 PrintWindow 로 캡처**합니다. 전체 화면 앱이 덮고 있거나
+  위젯이 다른 모니터에 있어도 잡힙니다. 결과는 `%LOCALAPPDATA%\Temp\widget-window.png` 에 저장되며, 출력에 창의 실제 좌표가 함께 나옵니다.
+
+```bash
+cd /mnt/c/Users/user && powershell.exe -NoProfile -ExecutionPolicy Bypass -File '\\wsl.localhost\Ubuntu\home\hyoje\src\projects\ai-tool-limit\tools\capture-widget.ps1' | tr -d '\r'
+```
+
+- 화면 전체 맥락이 필요할 때만 아래처럼 화면 영역을 캡처합니다. 모니터는 두 대이며 기본 모니터는 1920x1080, 왼쪽에 세로 1080x1920 모니터가 X=-1080 위치에 있습니다.
 
 ```bash
 cd /mnt/c/Users/user && powershell.exe -NoProfile -Command "Add-Type -AssemblyName System.Drawing,System.Windows.Forms; \$b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; \$r=New-Object System.Drawing.Rectangle (\$b.Width-480),(\$b.Height-300),480,300; \$bmp=New-Object System.Drawing.Bitmap \$r.Width,\$r.Height; \$g=[System.Drawing.Graphics]::FromImage(\$bmp); \$g.CopyFromScreen(\$r.Location,[System.Drawing.Point]::Empty,\$r.Size); \$bmp.Save('C:\Users\user\AppData\Local\Temp\widget-crop.png')"
