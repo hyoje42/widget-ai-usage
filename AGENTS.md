@@ -22,6 +22,10 @@ Windows 11 데스크톱에 항상 떠 있는 작은 위젯으로, Claude Code와
 - **주기적인 headless 메시지 전송은 하지 않습니다.** 사용량을 소모하고 세션 기록이 쌓입니다.
 - Codex 토큰은 수명이 일주일 이상이므로 별도 갱신 로직을 두지 않습니다.
 - API를 호출하지 못하는 동안에는 마지막 값을 유지하고, 리셋 시각이 지나면 로컬에서 0% 사용으로 되돌립니다.
+- **위젯은 한 번에 하나만 실행됩니다.** 이미 실행 중인데 다시 실행하면, 새 프로세스는 로그를 남기고 즉시 종료합니다.
+  위젯은 항상 최상위(`Topmost`)로 떠 있으므로 창을 앞으로 가져오는 처리는 하지 않습니다.
+  재시작할 때마다 즉시 API를 호출하기 때문에, 짧은 시간에 여러 번 재시작하면 HTTP 429 가 발생합니다.
+  의도적으로 교체해야 하는 설치 과정에서만 `-Force` 를 사용합니다.
 
 ## 3. 환경 사실
 
@@ -105,6 +109,9 @@ tools/capture-widget.ps1  # 개발용: 위젯 창을 PNG 로 캡처 (설치 대�
 AGENTS.md / CLAUDE.md # 이 지침
 ```
 
+- 바로가기에는 `-Force` 를 넣지 않습니다. 넣으면 시작 메뉴에서 누를 때마다 위젯이 재시작됩니다.
+  설치 스크립트가 직접 실행할 때에만 `-Force` 를 붙입니다.
+
 - 개발은 이 WSL 폴더에서 합니다. 설치 대상 폴더는 `%LOCALAPPDATA%\ai-usage-widget\` 입니다.
 - 상태 파일: `%LOCALAPPDATA%\ai-usage-widget\state.json` (창 위치, 마지막 값), `widget.pid` (실행 중인 프로세스 ID).
 - 위젯 창 제목은 `AI Usage Widget` 으로 고정합니다. 종료 시에는 `widget.pid` 를 우선 사용하고, 없으면 창 제목으로 찾습니다.
@@ -123,9 +130,12 @@ cd /mnt/c/Users/user && powershell.exe -NoProfile -ExecutionPolicy Bypass -File 
 
 # 위젯 종료
 cd /mnt/c/Users/user && powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\ai-usage-widget\ai-usage-widget.ps1" -Stop | tr -d '\r'
+
+# 실행 중인 인스턴스를 교체하며 시작 (평소에는 필요하지 않습니다)
+cd /mnt/c/Users/user && powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -STA -File "$env:LOCALAPPDATA\ai-usage-widget\ai-usage-widget.ps1" -Force
 ```
 
-- `-FetchOnly` 와 `-Stop` 스위치는 위젯 스크립트가 반드시 지원해야 합니다.
+- `-FetchOnly`, `-Stop`, `-Force` 스위치는 위젯 스크립트가 반드시 지원해야 합니다.
 - 화면 확인은 `tools/capture-widget.ps1` 로 **위젯 창 자체를 PrintWindow 로 캡처**합니다. 전체 화면 앱이 덮고 있거나
   위젯이 다른 모니터에 있어도 잡힙니다. 결과는 `%LOCALAPPDATA%\Temp\widget-window.png` 에 저장되며, 출력에 창의 실제 좌표가 함께 나옵니다.
 
