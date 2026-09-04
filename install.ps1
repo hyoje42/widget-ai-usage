@@ -23,6 +23,7 @@ $installDir = Join-Path $env:LOCALAPPDATA 'ai-usage-widget'
 $widget     = Join-Path $installDir 'ai-usage-widget.ps1'
 $startup    = [Environment]::GetFolderPath('Startup')
 $programs   = [Environment]::GetFolderPath('Programs')
+$icon       = Join-Path $installDir 'ai-usage-widget.ico'
 $shortcut   = Join-Path $startup 'AI Usage Widget.lnk'
 $menuLink   = Join-Path $programs 'AI Usage Widget.lnk'
 $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -44,7 +45,7 @@ if (Test-Path $widget) {
     Write-Output "Previous instance: $stopResult"
 }
 
-foreach ($file in @('ai-usage-widget.ps1', 'uninstall.ps1')) {
+foreach ($file in @('ai-usage-widget.ps1', 'uninstall.ps1', 'ai-usage-widget.ico')) {
     Copy-Item -LiteralPath (Join-Path $source $file) -Destination (Join-Path $installDir $file) -Force
     Write-Output "Copied:  $file"
 }
@@ -61,6 +62,7 @@ foreach ($path in @($shortcut, $menuLink)) {
     $lnk.WorkingDirectory = $installDir
     $lnk.WindowStyle = 7   # Minimized; the console is hidden by -WindowStyle Hidden anyway.
     $lnk.Description = 'AI Usage Widget (Claude Code / Codex remaining usage)'
+    if (Test-Path $icon) { $lnk.IconLocation = "$icon,0" }
     $lnk.Save()
     Write-Output "Shortcut: $path"
 }

@@ -8,3 +8,6 @@ widget.pid
 # Scratch and handoff artifacts
 .handoffs/
 scratch/
+
+# Python bytecode from the icon generator
+__pycache__/
