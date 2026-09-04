@@ -103,14 +103,20 @@ Windows 11 데스크톱에 항상 떠 있는 작은 위젯으로, Claude Code와
 
 ```
 ai-usage-widget.ps1   # 위젯 본체 (UI + 수집 + 갱신)
+ai-usage-widget.ico   # 바로가기 아이콘 (생성물이지만 저장소에 포함)
 install.ps1           # Windows 쪽 폴더로 복사, 시작 프로그램 바로가기 등록, 실행 중인 위젯 재시작
 uninstall.ps1         # 바로가기 제거, 위젯 종료
 tools/capture-widget.ps1  # 개발용: 위젯 창을 PNG 로 캡처 (설치 대상 아님)
+tools/make-icon.py    # 개발용: 아이콘을 코드로 렌더링 (설치 대상 아님)
 AGENTS.md / CLAUDE.md # 이 지침
 ```
 
 - 바로가기에는 `-Force` 를 넣지 않습니다. 넣으면 시작 메뉴에서 누를 때마다 위젯이 재시작됩니다.
   설치 스크립트가 직접 실행할 때에만 `-Force` 를 붙입니다.
+- 아이콘은 Windows 에 이미지 도구가 없으므로 WSL 의 Python 표준 라이브러리만으로 렌더링합니다
+  (`python3 tools/make-icon.py`). 부호 있는 거리 함수로 그려서 별도 라이브러리 없이 계단 현상을 없앱니다.
+  16~48px 는 단일 링, 64px 이상은 이중 링으로 분기합니다. 작은 크기에서 두 링이 뭉개지기 때문입니다.
+  아이콘을 다시 만들면 Windows 아이콘 캐시 때문에 화면에 바로 반영되지 않을 수 있습니다.
 
 - 개발은 이 WSL 폴더에서 합니다. 설치 대상 폴더는 `%LOCALAPPDATA%\ai-usage-widget\` 입니다.
 - 상태 파일: `%LOCALAPPDATA%\ai-usage-widget\state.json` (창 위치, 마지막 값), `widget.pid` (실행 중인 프로세스 ID).
