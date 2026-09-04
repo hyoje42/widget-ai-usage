@@ -19,12 +19,18 @@
 
 .PARAMETER IntervalMinutes
     Override the fetch interval for this run (persisted to state.json).
+
+.PARAMETER Force
+    Replace a running instance instead of exiting. Without it, launching the
+    widget while it already runs is a no-op, so repeated Start Menu clicks do
+    not restart it (each restart fetches immediately and can trip HTTP 429).
 #>
 [CmdletBinding()]
 param(
     [switch]$FetchOnly,
     [switch]$Stop,
-    [int]$IntervalMinutes = 0
+    [int]$IntervalMinutes = 0,
+    [switch]$Force
 )
 
 Set-StrictMode -Version 2.0
@@ -404,18 +410,35 @@ function Load-State {
 # ---------------------------------------------------------------------------
 # Process management
 # ---------------------------------------------------------------------------
+# Returns the process of a live widget instance, or $null. The pid file is the
+# only reliable handle: WS_EX_TOOLWINDOW leaves MainWindowTitle empty, so the
+# window title cannot identify a running widget.
+function Get-RunningInstance {
+    try {
+        if (-not (Test-Path $script:Config.PidFile)) { return $null }
+        $raw = (Get-Content $script:Config.PidFile -Raw).Trim()
+        $oldPid = 0
+        if (-not [int]::TryParse($raw, [ref]$oldPid)) { return $null }
+        if ($oldPid -eq $PID) { return $null }
+        $proc = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
+        if ($null -eq $proc) { return $null }
+        if ($proc.ProcessName -notlike 'powershell*') { return $null }
+        # Guard against pid reuse: the command line must mention this script.
+        $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $oldPid" -ErrorAction SilentlyContinue
+        if ($null -ne $cim -and $cim.CommandLine -notlike '*ai-usage-widget*') { return $null }
+        return $proc
+    } catch { return $null }
+}
+
 function Stop-ExistingInstance {
     $stopped = $false
     try {
+        $running = Get-RunningInstance
+        if ($null -ne $running) {
+            Stop-Process -Id $running.Id -Force
+            $stopped = $true
+        }
         if (Test-Path $script:Config.PidFile) {
-            $oldPid = [int](Get-Content $script:Config.PidFile -Raw).Trim()
-            if ($oldPid -ne $PID) {
-                $proc = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
-                if ($null -ne $proc -and $proc.ProcessName -like 'powershell*') {
-                    Stop-Process -Id $oldPid -Force
-                    $stopped = $true
-                }
-            }
             Remove-Item $script:Config.PidFile -Force -ErrorAction SilentlyContinue
         }
     } catch { }
@@ -514,6 +537,14 @@ public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
 [DllImport("user32.dll", SetLastError = true)]
 public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
 '@
+
+# The widget is Topmost, so an already-running instance is visible where the
+# user left it; launching a second one would only restart the fetch cycle.
+$script:Running = Get-RunningInstance
+if ($null -ne $script:Running -and -not $Force) {
+    Write-Log ("already running pid={0}; exiting" -f $script:Running.Id)
+    exit 0
+}
 
 Stop-ExistingInstance | Out-Null
 Write-PidFile

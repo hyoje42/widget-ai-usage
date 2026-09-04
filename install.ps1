@@ -27,6 +27,9 @@ $shortcut   = Join-Path $startup 'AI Usage Widget.lnk'
 $menuLink   = Join-Path $programs 'AI Usage Widget.lnk'
 $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $launchArgs = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -STA -File "{0}"' -f $widget
+# Shortcuts stay without -Force so clicking one while the widget runs is a
+# no-op; only this installer replaces a running instance.
+$startArgs  = '{0} -Force' -f $launchArgs
 
 Write-Output "Source:  $source"
 Write-Output "Install: $installDir"
@@ -48,8 +51,8 @@ foreach ($file in @('ai-usage-widget.ps1', 'uninstall.ps1')) {
 
 # Shortcuts (overwritten on every install so argument changes propagate):
 # one in Startup for auto-launch at login, one in the Start Menu so the
-# widget can be found by typing its name. Launching while it already runs
-# simply restarts it.
+# widget can be found by typing its name. Clicking one while the widget
+# already runs does nothing, since neither carries -Force.
 $shell = New-Object -ComObject WScript.Shell
 foreach ($path in @($shortcut, $menuLink)) {
     $lnk = $shell.CreateShortcut($path)
@@ -63,7 +66,7 @@ foreach ($path in @($shortcut, $menuLink)) {
 }
 
 if (-not $NoStart) {
-    Start-Process -FilePath $powershell -ArgumentList $launchArgs -WorkingDirectory $installDir -WindowStyle Hidden
+    Start-Process -FilePath $powershell -ArgumentList $startArgs -WorkingDirectory $installDir -WindowStyle Hidden
     Write-Output 'Started widget.'
 }
 Write-Output 'Done.'
