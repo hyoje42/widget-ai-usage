@@ -129,7 +129,7 @@ WSL에서 위젯을 띄우거나 테스트할 때 사용하는 명령입니다.
 
 ```bash
 # 설치(복사 + 바로가기 등록 + 재시작)
-cd /mnt/c/Users/user && powershell.exe -NoProfile -ExecutionPolicy Bypass -File '\\wsl.localhost\Ubuntu\home\hyoje\src\projects\ai-tool-limit\install.ps1' | tr -d '\r'
+cd /mnt/c/Users/user && powershell.exe -NoProfile -ExecutionPolicy Bypass -File '\\wsl.localhost\Ubuntu\home\hyoje\src\projects\ai-usage-widget\install.ps1' | tr -d '\r'
 
 # 화면 없이 수집 결과만 JSON으로 출력 (토큰 값은 출력하지 않음)
 cd /mnt/c/Users/user && powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\ai-usage-widget\ai-usage-widget.ps1" -FetchOnly | tr -d '\r'
@@ -146,7 +146,7 @@ cd /mnt/c/Users/user && powershell.exe -NoProfile -ExecutionPolicy Bypass -Windo
   위젯이 다른 모니터에 있어도 잡힙니다. 결과는 `%LOCALAPPDATA%\Temp\widget-window.png` 에 저장되며, 출력에 창의 실제 좌표가 함께 나옵니다.
 
 ```bash
-cd /mnt/c/Users/user && powershell.exe -NoProfile -ExecutionPolicy Bypass -File '\\wsl.localhost\Ubuntu\home\hyoje\src\projects\ai-tool-limit\tools\capture-widget.ps1' | tr -d '\r'
+cd /mnt/c/Users/user && powershell.exe -NoProfile -ExecutionPolicy Bypass -File '\\wsl.localhost\Ubuntu\home\hyoje\src\projects\ai-usage-widget\tools\capture-widget.ps1' | tr -d '\r'
 ```
 
 - 화면 전체 맥락이 필요할 때만 아래처럼 화면 영역을 캡처합니다. 모니터는 두 대이며 기본 모니터는 1920x1080, 왼쪽에 세로 1080x1920 모니터가 X=-1080 위치에 있습니다.
