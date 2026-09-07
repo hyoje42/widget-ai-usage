@@ -15,12 +15,21 @@ Windows 11 데스크톱에 항상 떠 있는 작은 위젯으로, Claude Code와
 - 토큰은 **WSL 안의 파일을 UNC 경로로 읽기만** 합니다. WSL을 깨우지 않고 PowerShell의
   `Invoke-RestMethod` 로 API를 직접 호출합니다.
 - **토큰 갱신은 만료를 감지했을 때 한 번만** WSL의 Claude CLI를 호출해서 처리합니다.
-  - 1순위: `wsl.exe -d Ubuntu -u hyoje -- claude auth status` (만료 토큰을 갱신하는지 아직 미확인)
-  - 2순위(1순위가 갱신하지 않을 때): `wsl.exe -d Ubuntu -u hyoje -- claude -p "ok" --model haiku`
+  - 명령: `wsl.exe -d Ubuntu -u hyoje -- claude -p "ok" --model haiku`
+  - Claude Code는 요청을 보내기 직전에 만료된 토큰을 갱신하므로, 최소 메시지 한 건이 곧 갱신 수단입니다.
+  - `claude auth status` 는 저장된 자격 증명을 출력만 하고 갱신하지 않습니다(위젯 로그 8회 시도 중 0회 갱신, 2026-09-07 확인).
+    한때 1순위로 썼으나 30초만 낭비해서 제거했습니다.
+- WSL 명령의 표준 오류는 마지막 3줄을 위젯 로그에 남깁니다(이메일은 가림). 갱신 실패 원인을 진단하는 용도입니다.
 - 위젯이 **refresh_token으로 직접 토큰을 갱신하지 않습니다.** Claude Code와 동시에 갱신하면
   서로의 토큰을 무효화할 수 있습니다.
 - **주기적인 headless 메시지 전송은 하지 않습니다.** 사용량을 소모하고 세션 기록이 쌓입니다.
-- Codex 토큰은 수명이 일주일 이상이므로 별도 갱신 로직을 두지 않습니다.
+- Codex 토큰도 같은 원칙으로, **만료를 감지했을 때 한 번만** WSL의 Codex CLI를 호출해서 갱신합니다.
+  - 명령: `wsl.exe -d Ubuntu -u hyoje -- codex doctor --summary`
+  - 근거(codex-rs `login/src/auth/manager.rs`): `doctor` 가 `AuthManager::auth()` 를 호출하고,
+    이 함수는 access token 만료 5분 전이거나 `last_refresh` 가 8일이 지났으면 refresh_token으로 갱신합니다.
+    모델 요청을 보내지 않으므로 사용량을 소모하지 않습니다. `codex login status` 는 파일만 읽고 갱신하지 않습니다.
+  - 실제로 갱신되는지는 아직 실환경에서 확인하지 못했습니다(2026-09-07 기준). 확인되면 이 줄을 갱신하십시오.
+- 갱신 쿨다운(15분)은 서비스별로 따로 적용됩니다. Claude 갱신 시도가 Codex 갱신을 막지 않습니다.
 - API를 호출하지 못하는 동안에는 마지막 값을 유지하고, 리셋 시각이 지나면 로컬에서 0% 사용으로 되돌립니다.
 - **위젯은 한 번에 하나만 실행됩니다.** 이미 실행 중인데 다시 실행하면, 새 프로세스는 로그를 남기고 즉시 종료합니다.
   위젯은 항상 최상위(`Topmost`)로 떠 있으므로 창을 앞으로 가져오는 처리는 하지 않습니다.
@@ -57,7 +66,9 @@ Windows 11 데스크톱에 항상 떠 있는 작은 위젯으로, Claude Code와
 ### Codex
 - 토큰 파일: `~/.codex/auth.json` → `tokens.access_token`, `tokens.account_id`
 - 요청: `GET https://chatgpt.com/backend-api/wham/usage`
-  - 헤더: `Authorization: Bearer <access_token>`, `ChatGPT-Account-ID: <account_id>`, `User-Agent: codex-cli`
+  - 헤더: `Authorization: Bearer <access_token>`, `ChatGPT-Account-ID: <account_id>`
+- access token은 JWT이며 `exp` 클레임으로 만료를 판단합니다(수명 약 10일, `id_token` 은 1시간이지만 사용하지 않음).
+  `auth.json` 의 `last_refresh` 는 Codex CLI가 마지막으로 갱신한 시각입니다.
 - 사용하는 응답 필드:
   - `rate_limit.primary_window.used_percent`, `rate_limit.primary_window.reset_at` (epoch s) — 5시간 창
   - `rate_limit.secondary_window.used_percent`, `rate_limit.secondary_window.reset_at` — 7일 창
@@ -164,4 +175,4 @@ cd /mnt/c/Users/user && powershell.exe -NoProfile -Command "Add-Type -AssemblyNa
 - 사용자에게는 **한국어**로 응답합니다.
 - **코드 주석과 커밋 메시지는 영어**로 작성합니다. 커밋 제목은 명령형, 72자 이내.
 - 커밋은 사용자가 명시적으로 승인한 뒤에만 합니다.
-- 아직 검증하지 않은 사항(예: `claude auth status` 가 만료 토큰을 갱신하는지)은 검증 후 이 문서를 갱신합니다.
+- 아직 검증하지 않은 사항(예: `codex doctor` 가 만료 토큰을 실제로 갱신하는지)은 검증 후 이 문서를 갱신합니다.
