@@ -46,13 +46,18 @@ $script:Config = @{
     WindowTitle            = 'AI Usage Widget'
     StateDir               = (Join-Path $env:LOCALAPPDATA 'ai-usage-widget')
     DefaultIntervalMinutes = 2
-    IntervalChoices        = @(1, 2, 5, 10)
+    IntervalChoices        = @(2, 5, 10)
     HttpTimeoutSec         = 15
     RefreshCooldownMinutes = 15
     BarWidth               = 150.0
     BarHeight              = 14.0
-    SoonMinutes            = 30
     LowRemaining           = 20
+    # 리셋 카운트다운 색상 임계값(분). 창마다 전체 주기가 달라 따로 잡습니다.
+    #   Soon 이하 -> 초록, Far 초과 -> 빨강, 그 사이 -> 기본 텍스트 색.
+    ResetThresholds        = @{
+        '5h' = @{ Soon = 30;  Far = 120 }   # 30분 / 2시간
+        '7d' = @{ Soon = 720; Far = 4320 }  # 12시간 / 3일
+    }
     ClaudeUsageUrl         = 'https://api.anthropic.com/api/oauth/usage'
     CodexUsageUrl          = 'https://chatgpt.com/backend-api/wham/usage'
 }
@@ -488,7 +493,10 @@ function Load-State {
         if ($null -ne $left) { $script:Settings.Left = [double]$left }
         if ($null -ne $top)  { $script:Settings.Top  = [double]$top }
         $iv = Get-PropertyOrNull $state 'IntervalMinutes'
-        if ($null -ne $iv -and [int]$iv -gt 0) { $script:Settings.IntervalMinutes = [int]$iv }
+        # Ignore intervals no longer offered (e.g. 1 minute) and keep the default.
+        if ($null -ne $iv -and ($script:Config.IntervalChoices -contains [int]$iv)) {
+            $script:Settings.IntervalMinutes = [int]$iv
+        }
 
         $services = Get-PropertyOrNull $state 'Services'
         foreach ($name in @('Claude', 'Codex')) {
@@ -655,7 +663,13 @@ if ($null -ne $script:Running -and -not $Force) {
 Stop-ExistingInstance | Out-Null
 Write-PidFile
 Load-State
-if ($IntervalMinutes -gt 0) { $script:Settings.IntervalMinutes = $IntervalMinutes }
+if ($IntervalMinutes -gt 0) {
+    if ($script:Config.IntervalChoices -contains $IntervalMinutes) {
+        $script:Settings.IntervalMinutes = $IntervalMinutes
+    } else {
+        Write-Log ("ignoring unsupported interval {0}m; using {1}m" -f $IntervalMinutes, $script:Settings.IntervalMinutes)
+    }
+}
 Write-Log ("widget starting pid={0} interval={1}m" -f $PID, $script:Settings.IntervalMinutes)
 
 $script:BrushConverter = New-Object System.Windows.Media.BrushConverter
@@ -922,16 +936,20 @@ function Get-BarBrush {
     if ($null -eq $Remaining) { return $script:Colors.Stale }
     if (-not $Fresh) { return $script:Colors.Stale }
     if ($Remaining -ge 50) { return $script:Colors.Good }
-    if ($Remaining -ge 20) { return $script:Colors.Warn }
+    if ($Remaining -ge $script:Config.LowRemaining) { return $script:Colors.Warn }
     return $script:Colors.Bad
 }
 
 function Get-ResetPresentation {
-    # Decides text, colour and weight of the reset countdown:
-    #   - reset within SoonMinutes  -> green, bold, with a refresh arrow
-    #   - low remaining, long wait  -> red
-    #   - otherwise                 -> normal text (grey when stale)
-    param($Remaining, $ResetsAt, [bool]$Fresh)
+    # Decides text, colour and weight of the reset countdown. Judged purely on
+    # time left; how much quota remains is already shown by the bar colour.
+    # Thresholds come from ResetThresholds because the 5h and 7d windows run on
+    # very different cycles:
+    #   - within Soon -> red, bold, with a refresh arrow: the reset is close,
+    #     so spend what is left before it is wiped
+    #   - beyond Far  -> green (no reason to hurry; the window is far away)
+    #   - in between  -> normal text (grey when stale)
+    param($ResetsAt, [bool]$Fresh, [string]$Window)
     $text = Format-Countdown $ResetsAt
     if ([string]::IsNullOrEmpty($text)) {
         return @{ Text = ''; Brush = $script:Colors.Dim; Bold = $false }
@@ -939,12 +957,13 @@ function Get-ResetPresentation {
     if (-not $Fresh) {
         return @{ Text = $text; Brush = $script:Colors.Stale; Bold = $false }
     }
+    $limits = $script:Config.ResetThresholds[$Window]
     $minutesLeft = ($ResetsAt - [DateTimeOffset]::UtcNow).TotalMinutes
-    if ($minutesLeft -le $script:Config.SoonMinutes) {
-        return @{ Text = ([string][char]0x21BB + ' ' + $text); Brush = $script:Colors.Good; Bold = $true }
+    if ($minutesLeft -le $limits.Soon) {
+        return @{ Text = ([string][char]0x21BB + ' ' + $text); Brush = $script:Colors.Bad; Bold = $true }
     }
-    if ($null -ne $Remaining -and [int]$Remaining -lt $script:Config.LowRemaining -and $minutesLeft -ge 60) {
-        return @{ Text = $text; Brush = $script:Colors.Bad; Bold = $false }
+    if ($minutesLeft -gt $limits.Far) {
+        return @{ Text = $text; Brush = $script:Colors.Good; Bold = $false }
     }
     return @{ Text = $text; Brush = $script:Colors.Text; Bold = $false }
 }
@@ -967,7 +986,7 @@ function Update-ServiceView {
         }
         $fill.Background = Get-BarBrush -Remaining $remaining -Fresh $fresh
 
-        $reset = Get-ResetPresentation -Remaining $remaining -ResetsAt $resetAt -Fresh $fresh
+        $reset = Get-ResetPresentation -ResetsAt $resetAt -Fresh $fresh -Window $win
         $rt = $view["Reset$win"]
         $rt.Text = $reset.Text
         $rt.Foreground = $reset.Brush
