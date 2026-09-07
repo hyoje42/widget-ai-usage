@@ -62,7 +62,10 @@ $script:Config.StateFile         = Join-Path $script:Config.StateDir 'state.json
 $script:Config.PidFile           = Join-Path $script:Config.StateDir 'widget.pid'
 $script:Config.LogFile           = Join-Path $script:Config.StateDir 'widget.log'
 
-$script:LastRefreshAttempt = [DateTimeOffset]::MinValue
+$script:LastRefreshAttempt = @{
+    Claude = [DateTimeOffset]::MinValue
+    Codex  = [DateTimeOffset]::MinValue
+}
 
 # ---------------------------------------------------------------------------
 # Logging (never log tokens, emails or account ids)
@@ -111,6 +114,28 @@ function Get-PropertyOrNull {
     $prop = $Object.PSObject.Properties[$Name]
     if ($null -eq $prop) { return $null }
     return $prop.Value
+}
+
+function Get-JwtExpiry {
+    # Decodes the "exp" claim of a JWT without validating the signature.
+    # Returns $null when the token is not a JWT or has no exp claim.
+    param([string]$Jwt)
+    try {
+        if ([string]::IsNullOrWhiteSpace($Jwt)) { return $null }
+        $parts = $Jwt.Split('.')
+        if ($parts.Length -lt 2) { return $null }
+        $payload = $parts[1].Replace('-', '+').Replace('_', '/')
+        switch ($payload.Length % 4) {
+            2 { $payload += '==' }
+            3 { $payload += '=' }
+        }
+        $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload))
+        $exp = Get-PropertyOrNull ($json | ConvertFrom-Json) 'exp'
+        if ($null -eq $exp) { return $null }
+        return [DateTimeOffset]::FromUnixTimeSeconds([int64]$exp)
+    } catch {
+        return $null
+    }
 }
 
 function New-UsageResult {
@@ -214,6 +239,18 @@ function Get-ClaudeUsage {
     return $result
 }
 
+function Test-CodexTokenValid {
+    # Returns $true when the stored access token (a JWT) is not yet expired.
+    # A token whose expiry cannot be decoded is treated as valid so that the
+    # API response (401) remains the final authority.
+    $auth = Read-JsonFile $script:Config.CodexAuth
+    $tokens = Get-PropertyOrNull $auth 'tokens'
+    if ($null -eq $tokens) { return $false }
+    $expiresAt = Get-JwtExpiry (Get-PropertyOrNull $tokens 'access_token')
+    if ($null -eq $expiresAt) { return $true }
+    return ($expiresAt -gt [DateTimeOffset]::UtcNow.AddMinutes(1))
+}
+
 function Get-CodexUsage {
     $result = New-UsageResult -Name 'Codex'
     try {
@@ -223,10 +260,14 @@ function Get-CodexUsage {
             $result.Message = 'auth not found'
             return $result
         }
+        if (-not (Test-CodexTokenValid)) {
+            $result.Status = 'expired'
+            $result.Message = 'token expired'
+            return $result
+        }
         $headers = @{
             'Authorization'      = 'Bearer ' + $tokens.access_token
             'ChatGPT-Account-ID' = [string]$tokens.account_id
-            'User-Agent'         = 'codex-cli'
         }
         $resp = Invoke-RestMethod -Uri $script:Config.CodexUsageUrl -Headers $headers `
             -Method Get -TimeoutSec $script:Config.HttpTimeoutSec
@@ -250,7 +291,7 @@ function Get-CodexUsage {
         $code = Get-HttpStatusCode $_
         if ($code -eq 401) {
             $result.Status = 'expired'
-            $result.Message = 'token rejected (run codex)'
+            $result.Message = 'token rejected (401)'
         } else {
             $result.Message = if ($code -gt 0) { "http $code" } else { $_.Exception.Message }
         }
@@ -259,40 +300,100 @@ function Get-CodexUsage {
 }
 
 # ---------------------------------------------------------------------------
-# Claude token refresh: only when expired, at most once per cooldown window.
-# Never touches the credential file directly; lets the Claude CLI do it.
+# Token refresh: only when expired, at most once per cooldown window per
+# service. Never touches the credential files directly; lets each CLI do it.
 # ---------------------------------------------------------------------------
+function Get-CapturedStderr {
+    # Reads a captured stderr file, deletes it, and returns its last lines as a
+    # single log-safe line (emails masked, length capped). Never throws.
+    param([string]$Path)
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return '' }
+        $text = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if ([string]::IsNullOrWhiteSpace($text)) { return '' }
+        $lines = @($text -split "`r?`n" | Where-Object { $_.Trim() -ne '' })
+        $out = (($lines | Select-Object -Last 3) -join ' | ')
+        $out = [regex]::Replace($out, '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', '<email>')
+        if ($out.Length -gt 400) { $out = $out.Substring(0, 400) + '...' }
+        return $out
+    } catch {
+        return ''
+    }
+}
+
 function Invoke-WslCommand {
+    # Runs a fixed command inside WSL with no visible window. Returns the exit
+    # code (-1 on timeout) and logs the tail of stderr so failures can be diagnosed.
     param([string]$BashCommand, [int]$TimeoutSec = 120)
     $argList = '-d {0} -u {1} -- bash -lc "{2}"' -f $script:Config.WslDistro, $script:Config.WslUser, $BashCommand
-    $proc = Start-Process -FilePath 'wsl.exe' -ArgumentList $argList -WindowStyle Hidden -PassThru
-    if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
-        try { $proc.Kill() } catch { }
-        return -1
+    if (-not (Test-Path $script:Config.StateDir)) {
+        New-Item -ItemType Directory -Path $script:Config.StateDir -Force | Out-Null
     }
-    return $proc.ExitCode
+    # Unique per call: a file left locked by a killed process must not break
+    # the next call. Stale files from earlier runs are swept opportunistically.
+    try {
+        Get-ChildItem -LiteralPath $script:Config.StateDir -Filter 'wsl-stderr-*.txt' -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-1) } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    } catch { }
+    $errFile = Join-Path $script:Config.StateDir ('wsl-stderr-{0}-{1}.txt' -f $PID, [Guid]::NewGuid().ToString('N').Substring(0, 8))
+    # wsl.exe writes UTF-16 to redirected handles unless told otherwise.
+    $env:WSL_UTF8 = '1'
+    $proc = Start-Process -FilePath 'wsl.exe' -ArgumentList $argList -WindowStyle Hidden -PassThru `
+        -RedirectStandardError $errFile
+    # Touch Handle so that ExitCode is populated after exit (PowerShell 5.1 quirk).
+    $null = $proc.Handle
+    if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+        try { $proc.Kill(); $proc.WaitForExit(5000) | Out-Null } catch { }
+        $code = -1
+    } else {
+        $code = $proc.ExitCode
+    }
+    $stderr = Get-CapturedStderr $errFile
+    if ($stderr) { Write-Log ("wsl stderr [{0}]: {1}" -f $BashCommand, $stderr) }
+    return $code
+}
+
+function Test-RefreshAllowed {
+    # Enforces the per-service cooldown and records the attempt when allowed.
+    param([string]$Name)
+    $now = [DateTimeOffset]::UtcNow
+    if (($now - $script:LastRefreshAttempt[$Name]).TotalMinutes -lt $script:Config.RefreshCooldownMinutes) {
+        return $false
+    }
+    $script:LastRefreshAttempt[$Name] = $now
+    return $true
 }
 
 function Invoke-ClaudeTokenRefresh {
-    $now = [DateTimeOffset]::UtcNow
-    if (($now - $script:LastRefreshAttempt).TotalMinutes -lt $script:Config.RefreshCooldownMinutes) {
-        return $false
-    }
-    $script:LastRefreshAttempt = $now
+    # Claude Code refreshes an expired OAuth token right before it sends a
+    # request, so one minimal headless message is the refresh mechanism.
+    # ("claude auth status" only prints the stored credentials; it never
+    # refreshed the token in 8 of 8 logged attempts.)
+    if (-not (Test-RefreshAllowed -Name 'Claude')) { return $false }
 
-    Write-Log 'claude token expired; trying "claude auth status"'
-    $code = Invoke-WslCommand -BashCommand 'claude auth status' -TimeoutSec 60
-    Write-Log ("claude auth status exit={0}" -f $code)
-    if (Test-ClaudeTokenValid) {
-        Write-Log 'claude token refreshed by auth status'
-        return $true
-    }
-
-    Write-Log 'still expired; sending one minimal headless message'
+    Write-Log 'claude token expired; sending one minimal headless message'
     $code = Invoke-WslCommand -BashCommand 'claude -p ok --model haiku' -TimeoutSec 180
     Write-Log ("claude -p exit={0}" -f $code)
     $ok = Test-ClaudeTokenValid
     Write-Log ("claude token valid after ping={0}" -f $ok)
+    return $ok
+}
+
+function Invoke-CodexTokenRefresh {
+    # "codex doctor" goes through AuthManager::auth(), which refreshes the
+    # ChatGPT token with the stored refresh_token when the access token expires
+    # within 5 minutes or last_refresh is older than 8 days. It sends no model
+    # request, so it consumes no usage. The doctor also runs network reachability
+    # checks, hence the longer timeout.
+    if (-not (Test-RefreshAllowed -Name 'Codex')) { return $false }
+
+    Write-Log 'codex token expired; trying "codex doctor --summary"'
+    $code = Invoke-WslCommand -BashCommand 'codex doctor --summary' -TimeoutSec 120
+    Write-Log ("codex doctor exit={0}" -f $code)
+    $ok = Test-CodexTokenValid
+    Write-Log ("codex token valid after doctor={0}" -f $ok)
     return $ok
 }
 
@@ -473,6 +574,11 @@ function Update-AllServices {
     Merge-UsageResult -State $script:Services.Claude -Result $claude
 
     $codex = Get-CodexUsage
+    if ($AllowRefresh -and $codex.Status -eq 'expired') {
+        if (Invoke-CodexTokenRefresh) {
+            $codex = Get-CodexUsage
+        }
+    }
     Merge-UsageResult -State $script:Services.Codex -Result $codex
 
     Write-Log ("fetch claude={0}{1} codex={2}{3}" -f $claude.Status,
