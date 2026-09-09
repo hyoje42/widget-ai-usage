@@ -62,6 +62,10 @@ $script:Config = @{
     StateDir               = (Join-Path $env:LOCALAPPDATA 'ai-usage-widget')
     DefaultIntervalMinutes = 2
     IntervalChoices        = @(2, 5, 10)
+    # Window transparency in percent. 0 is fully opaque; the highest choice
+    # still has to stay readable over a bright desktop background.
+    DefaultTransparency    = 0
+    TransparencyChoices    = @(0, 15, 30, 45)
     HttpTimeoutSec         = 15
     RefreshCooldownMinutes = 15
     BarWidth               = 150.0
@@ -702,9 +706,10 @@ function Update-LocalResets {
 # Persistent state (window position, interval, last known values)
 # ---------------------------------------------------------------------------
 $script:Settings = @{
-    Left            = $null
-    Top             = $null
-    IntervalMinutes = $script:Config.DefaultIntervalMinutes
+    Left                = $null
+    Top                 = $null
+    IntervalMinutes     = $script:Config.DefaultIntervalMinutes
+    TransparencyPercent = $script:Config.DefaultTransparency
 }
 
 function ConvertTo-IsoOrNull { param($Value) if ($null -eq $Value) { $null } else { $Value.ToString('o') } }
@@ -725,10 +730,11 @@ function Save-State {
             }
         }
         $state = @{
-            Left            = $script:Settings.Left
-            Top             = $script:Settings.Top
-            IntervalMinutes = $script:Settings.IntervalMinutes
-            Services        = $services
+            Left                = $script:Settings.Left
+            Top                 = $script:Settings.Top
+            IntervalMinutes     = $script:Settings.IntervalMinutes
+            TransparencyPercent = $script:Settings.TransparencyPercent
+            Services            = $services
         }
         $json = $state | ConvertTo-Json -Depth 5
         Set-Content -Path $script:Config.StateFile -Value $json -Encoding UTF8
@@ -749,6 +755,11 @@ function Load-State {
         # Ignore intervals no longer offered (e.g. 1 minute) and keep the default.
         if ($null -ne $iv -and ($script:Config.IntervalChoices -contains [int]$iv)) {
             $script:Settings.IntervalMinutes = [int]$iv
+        }
+        $tp = Get-PropertyOrNull $state 'TransparencyPercent'
+        # Same rule as the interval: drop values the menu no longer offers.
+        if ($null -ne $tp -and ($script:Config.TransparencyChoices -contains [int]$tp)) {
+            $script:Settings.TransparencyPercent = [int]$tp
         }
 
         $services = Get-PropertyOrNull $state 'Services'
@@ -1172,6 +1183,8 @@ $script:Window.ResizeMode = 'NoResize'
 $script:Window.SizeToContent = 'WidthAndHeight'
 $script:Window.WindowStartupLocation = 'Manual'
 $script:Window.Content = $root
+# The context menu lives in its own popup window, so it stays fully opaque.
+$script:Window.Opacity = (100 - $script:Settings.TransparencyPercent) / 100
 
 # Initial position is applied after the first render, when ActualWidth and
 # ActualHeight are known (SizeToContent). See Set-InitialPosition.
@@ -1347,6 +1360,15 @@ function Set-FetchInterval {
     Write-Log ("interval set to {0}m" -f $Minutes)
 }
 
+function Set-WindowTransparency {
+    param([int]$Percent)
+    $script:Settings.TransparencyPercent = $Percent
+    $script:Window.Opacity = (100 - $Percent) / 100
+    foreach ($item in $script:TransparencyItems) { $item.IsChecked = ([int]$item.Tag -eq $Percent) }
+    Save-State
+    Write-Log ("transparency set to {0}%" -f $Percent)
+}
+
 # ---------------------------------------------------------------------------
 # Context menu
 # ---------------------------------------------------------------------------
@@ -1376,6 +1398,24 @@ foreach ($m in $script:Config.IntervalChoices) {
     $script:IntervalItems += $item
 }
 $menu.Items.Add($miInterval) | Out-Null
+
+$miTransparency = New-Object System.Windows.Controls.MenuItem
+$miTransparency.Header = '투명도'
+$script:TransparencyItems = @()
+foreach ($t in $script:Config.TransparencyChoices) {
+    $item = New-Object System.Windows.Controls.MenuItem
+    if ($t -eq 0) { $item.Header = '없음' } else { $item.Header = ('{0}%' -f $t) }
+    $item.Tag = $t
+    $item.IsCheckable = $true
+    $item.IsChecked = ($t -eq $script:Settings.TransparencyPercent)
+    $item.Add_Click({
+        param($sender, $e)
+        try { Set-WindowTransparency -Percent ([int]$sender.Tag) } catch { Write-Log ("set transparency failed: {0}" -f $_.Exception.Message) }
+    })
+    $miTransparency.Items.Add($item) | Out-Null
+    $script:TransparencyItems += $item
+}
+$menu.Items.Add($miTransparency) | Out-Null
 
 $menu.Items.Add((New-Object System.Windows.Controls.Separator)) | Out-Null
 
