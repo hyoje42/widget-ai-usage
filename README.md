@@ -7,9 +7,10 @@ Claude Code와 Codex의 남은 사용량을 Windows 바탕화면에 항상 띄�
 
 Claude Code나 Codex CLI에 로그인되어 있으면 됩니다. WSL에 설치했든 Windows에 설치했든 상관없습니다.
 저장소를 clone 한 폴더에서 아래 한 줄을 실행하십시오.
+PowerShell에서 실행해도 되고, 저장소를 WSL 안에 두었다면 WSL 터미널에서 그대로 실행해도 됩니다.
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File '.\install.ps1'
 ```
 
 토큰이 어디에 있는지 알아서 찾고, 시작 프로그램에 등록한 뒤 위젯을 띄웁니다.
