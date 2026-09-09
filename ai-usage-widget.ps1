@@ -3,9 +3,13 @@
     Always-on-top desktop widget showing remaining Claude Code / Codex usage.
 
 .DESCRIPTION
-    Reads OAuth tokens from the WSL home directory (read-only, via UNC path),
-    calls the unofficial usage endpoints, and renders remaining percentage for
-    the 5-hour and 7-day windows of each service.
+    Reads OAuth tokens read-only from wherever each CLI keeps them (a WSL home
+    over a UNC path, or the Windows user profile), calls the unofficial usage
+    endpoints, and renders remaining percentage for the 5-hour and 7-day
+    windows of each service.
+
+    No host detail is hardcoded: the token locations are detected on first run
+    and cached in config.json next to the state file.
 
     Requires Windows PowerShell 5.1 with -STA (WPF). See AGENTS.md for the
     architecture decisions and security rules this script must follow.
@@ -24,13 +28,27 @@
     Replace a running instance instead of exiting. Without it, launching the
     widget while it already runs is a no-op, so repeated Start Menu clicks do
     not restart it (each restart fetches immediately and can trip HTTP 429).
+
+.PARAMETER Configure
+    Detect where each service keeps its tokens, write the result to config.json,
+    print it and exit. Run it after installing on a new machine, or whenever the
+    CLIs move (a different WSL distribution, a switch to a Windows install).
+
+.PARAMETER WslDistro
+    Name of the WSL distribution holding the CLI tokens. Detected when omitted.
+
+.PARAMETER WslUser
+    Linux user whose home holds the CLI tokens. Detected when omitted.
 #>
 [CmdletBinding()]
 param(
     [switch]$FetchOnly,
     [switch]$Stop,
     [int]$IntervalMinutes = 0,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$Configure,
+    [string]$WslDistro = '',
+    [string]$WslUser = ''
 )
 
 Set-StrictMode -Version 2.0
@@ -40,9 +58,6 @@ $ErrorActionPreference = 'Stop'
 # Configuration
 # ---------------------------------------------------------------------------
 $script:Config = @{
-    WslDistro              = 'Ubuntu'
-    WslUser                = 'hyoje'
-    WslHome                = '\\wsl.localhost\Ubuntu\home\hyoje'
     WindowTitle            = 'AI Usage Widget'
     StateDir               = (Join-Path $env:LOCALAPPDATA 'ai-usage-widget')
     DefaultIntervalMinutes = 2
@@ -61,8 +76,7 @@ $script:Config = @{
     ClaudeUsageUrl         = 'https://api.anthropic.com/api/oauth/usage'
     CodexUsageUrl          = 'https://chatgpt.com/backend-api/wham/usage'
 }
-$script:Config.ClaudeCredentials = Join-Path $script:Config.WslHome '.claude\.credentials.json'
-$script:Config.CodexAuth         = Join-Path $script:Config.WslHome '.codex\auth.json'
+$script:Config.ConfigFile        = Join-Path $script:Config.StateDir 'config.json'
 $script:Config.StateFile         = Join-Path $script:Config.StateDir 'state.json'
 $script:Config.PidFile           = Join-Path $script:Config.StateDir 'widget.pid'
 $script:Config.LogFile           = Join-Path $script:Config.StateDir 'widget.log'
@@ -95,9 +109,33 @@ function Write-Log {
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+function Test-PathSafe {
+    # Test-Path throws UnauthorizedAccessException on a path the process may not
+    # look at (a WSL home owned by another linux user, for one), and
+    # $ErrorActionPreference is Stop, so every probe of a path this widget does
+    # not own goes through here.
+    param([string]$Path)
+    try {
+        if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+        return [bool](Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue)
+    } catch {
+        return $false
+    }
+}
+
+function Get-FileWrittenAt {
+    # Last write time of a file, or $null when it cannot be inspected.
+    param([string]$Path)
+    try {
+        return (Get-Item -LiteralPath $Path -ErrorAction Stop).LastWriteTimeUtc
+    } catch {
+        return $null
+    }
+}
+
 function Read-JsonFile {
     param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    if (-not (Test-PathSafe $Path)) { return $null }
     $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
     if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
     return ($raw | ConvertFrom-Json)
@@ -143,11 +181,209 @@ function Get-JwtExpiry {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Token locations
+#
+# Where the CLIs keep their tokens differs per machine, so no path, distribution
+# or user name is hardcoded. Each service resolves to one of three sources:
+#   wsl     - a WSL home reached over \\wsl.localhost; the token file is read
+#             via UNC and a refresh runs through wsl.exe
+#   windows - the Windows user profile; a refresh runs the CLI directly
+#   off     - the service is hidden and never fetched
+# Resolution order: -WslDistro/-WslUser, then config.json, then detection. The
+# outcome is written back to config.json, so a normal start scans nothing.
+# Run with -Configure to detect again.
+# ---------------------------------------------------------------------------
+$script:TokenPaths = @{
+    Claude = '.claude\.credentials.json'
+    Codex  = '.codex\auth.json'
+}
+$script:Sources = @{
+    Claude = @{ Kind = 'unset'; TokenFile = '' }
+    Codex  = @{ Kind = 'unset'; TokenFile = '' }
+}
+$script:Wsl = @{ Distro = ''; User = '' }
+$script:ActiveServices = @('Claude', 'Codex')
+
+function Get-WslDistributionNames {
+    # Installed distributions, the default one first. Read from the registry
+    # because "wsl.exe -l" starts the WSL service merely to list them.
+    $names = @()
+    try {
+        $root = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
+        if (-not (Test-Path $root)) { return $names }
+        $defaultId = [string](Get-PropertyOrNull (Get-ItemProperty -Path $root -ErrorAction SilentlyContinue) 'DefaultDistribution')
+        foreach ($key in @(Get-ChildItem $root -ErrorAction SilentlyContinue)) {
+            $name = [string](Get-PropertyOrNull (Get-ItemProperty -Path $key.PSPath -ErrorAction SilentlyContinue) 'DistributionName')
+            if ([string]::IsNullOrWhiteSpace($name)) { continue }
+            if ($key.PSChildName -eq $defaultId) { $names = @($name) + $names } else { $names += $name }
+        }
+    } catch { }
+    return $names
+}
+
+function Get-WslHomePath {
+    param([string]$Distro, [string]$User)
+    if ($User -eq 'root') { return ('\\wsl.localhost\{0}\root' -f $Distro) }
+    return ('\\wsl.localhost\{0}\home\{1}' -f $Distro, $User)
+}
+
+function Get-WslHomeUsers {
+    # Every home in a distribution: each /home/<user>, plus /root.
+    param([string]$Distro)
+    $users = @()
+    try {
+        $homeRoot = '\\wsl.localhost\{0}\home' -f $Distro
+        if (Test-PathSafe $homeRoot) {
+            foreach ($dir in @(Get-ChildItem -LiteralPath $homeRoot -Directory -ErrorAction SilentlyContinue)) {
+                $users += $dir.Name
+            }
+        }
+    } catch { }
+    try {
+        if (Test-PathSafe ('\\wsl.localhost\{0}\root' -f $Distro)) { $users += 'root' }
+    } catch { }
+    return $users
+}
+
+function Find-TokenSource {
+    # Searches the Windows profile and every WSL home for the service's token
+    # file and returns the most recently written hit: the installation actually
+    # in use is the one whose token keeps getting refreshed. $null if none.
+    param([string]$Service)
+    $rel = $script:TokenPaths[$Service]
+    $hits = @()
+
+    $winFile = Join-Path $env:USERPROFILE $rel
+    $winAt = Get-FileWrittenAt $winFile
+    if ($null -ne $winAt) {
+        $hits += [pscustomobject]@{
+            Kind = 'windows'; Distro = ''; User = ''; TokenFile = $winFile; WrittenAt = $winAt
+        }
+    }
+    foreach ($distro in (Get-WslDistributionNames)) {
+        foreach ($user in (Get-WslHomeUsers -Distro $distro)) {
+            $file = Join-Path (Get-WslHomePath -Distro $distro -User $user) $rel
+            # An unreadable file is skipped: a home this user cannot open is no
+            # use as a token source even when the file exists.
+            $writtenAt = Get-FileWrittenAt $file
+            if ($null -eq $writtenAt) { continue }
+            $hits += [pscustomobject]@{
+                Kind = 'wsl'; Distro = $distro; User = $user; TokenFile = $file; WrittenAt = $writtenAt
+            }
+        }
+    }
+    if (@($hits).Count -eq 0) { return $null }
+    return (@($hits) | Sort-Object WrittenAt -Descending | Select-Object -First 1)
+}
+
+function Save-TokenConfig {
+    # Caches the resolved layout. Holds no credentials: a distribution name, a
+    # linux user name, and one source kind per service.
+    try {
+        if (-not (Test-Path $script:Config.StateDir)) {
+            New-Item -ItemType Directory -Path $script:Config.StateDir -Force | Out-Null
+        }
+        $data = [ordered]@{
+            wsl      = [ordered]@{ distro = $script:Wsl.Distro; user = $script:Wsl.User }
+            services = [ordered]@{
+                claude = $script:Sources.Claude.Kind
+                codex  = $script:Sources.Codex.Kind
+            }
+        }
+        Set-Content -Path $script:Config.ConfigFile -Value ($data | ConvertTo-Json -Depth 4) -Encoding UTF8
+    } catch {
+        Write-Log ("save config failed: {0}" -f $_.Exception.Message)
+    }
+}
+
+function Resolve-TokenSources {
+    # Fills $script:Wsl and $script:Sources, then caches the outcome. Detection
+    # runs only for a service that neither the command line nor config.json
+    # settled, or for every service when -Redetect is given.
+    param([switch]$Redetect)
+
+    $cfg    = Read-JsonFile $script:Config.ConfigFile
+    $cfgWsl = Get-PropertyOrNull $cfg 'wsl'
+    $cfgSvc = Get-PropertyOrNull $cfg 'services'
+
+    $script:Wsl.Distro = $WslDistro
+    $script:Wsl.User   = $WslUser
+    if ([string]::IsNullOrWhiteSpace($script:Wsl.Distro)) {
+        $script:Wsl.Distro = [string](Get-PropertyOrNull $cfgWsl 'distro')
+    }
+    if ([string]::IsNullOrWhiteSpace($script:Wsl.User)) {
+        $script:Wsl.User = [string](Get-PropertyOrNull $cfgWsl 'user')
+    }
+
+    foreach ($name in @('Claude', 'Codex')) {
+        $src = $script:Sources[$name]
+        $src.Kind = 'unset'
+        $src.TokenFile = ''
+        $stored = ''
+        if (-not $Redetect) { $stored = [string](Get-PropertyOrNull $cfgSvc $name.ToLower()) }
+        $haveWsl = -not ([string]::IsNullOrWhiteSpace($script:Wsl.Distro) -or
+                         [string]::IsNullOrWhiteSpace($script:Wsl.User))
+
+        if ($stored -eq 'off') {
+            $src.Kind = 'off'
+            continue
+        }
+        if ($stored -eq 'windows') {
+            $src.Kind = 'windows'
+            $src.TokenFile = Join-Path $env:USERPROFILE $script:TokenPaths[$name]
+            continue
+        }
+        if ($stored -eq 'wsl' -and $haveWsl) {
+            $src.Kind = 'wsl'
+            $src.TokenFile = Join-Path (Get-WslHomePath -Distro $script:Wsl.Distro -User $script:Wsl.User) $script:TokenPaths[$name]
+            continue
+        }
+        # Coordinates supplied but no stored decision: trust them when the file
+        # is really there, so an explicit -WslUser is never overridden.
+        if ($haveWsl) {
+            $file = Join-Path (Get-WslHomePath -Distro $script:Wsl.Distro -User $script:Wsl.User) $script:TokenPaths[$name]
+            if (Test-PathSafe $file) {
+                $src.Kind = 'wsl'
+                $src.TokenFile = $file
+                continue
+            }
+        }
+        $hit = Find-TokenSource -Service $name
+        if ($null -eq $hit) { continue }
+        $src.Kind = $hit.Kind
+        $src.TokenFile = $hit.TokenFile
+        if ($hit.Kind -eq 'wsl') {
+            if ([string]::IsNullOrWhiteSpace($script:Wsl.Distro)) { $script:Wsl.Distro = $hit.Distro }
+            if ([string]::IsNullOrWhiteSpace($script:Wsl.User))   { $script:Wsl.User   = $hit.User }
+        }
+    }
+    Save-TokenConfig
+}
+
+function Test-SourceUnavailable {
+    # Fills in the result and returns $true when a service has no usable token
+    # location, so the caller returns without touching the network.
+    param([string]$Service, $Result)
+    $src = $script:Sources[$Service]
+    if ($src.Kind -eq 'off') {
+        $Result.Status = 'off'
+        $Result.Message = 'disabled'
+        return $true
+    }
+    if ([string]::IsNullOrWhiteSpace($src.TokenFile)) {
+        $Result.Status = 'unset'
+        $Result.Message = 'token location not configured'
+        return $true
+    }
+    return $false
+}
+
 function New-UsageResult {
     param([string]$Name)
     return [ordered]@{
         Name      = $Name
-        Status    = 'error'     # ok | expired | error
+        Status    = 'error'     # ok | expired | error | unset | off
         Message   = ''
         FiveHour  = [ordered]@{ Remaining = $null; ResetsAt = $null }
         SevenDay  = [ordered]@{ Remaining = $null; ResetsAt = $null }
@@ -187,7 +423,7 @@ function Format-Countdown {
 # ---------------------------------------------------------------------------
 function Test-ClaudeTokenValid {
     # Returns $true when the stored access token is not yet expired.
-    $cred = Read-JsonFile $script:Config.ClaudeCredentials
+    $cred = Read-JsonFile $script:Sources.Claude.TokenFile
     $oauth = Get-PropertyOrNull $cred 'claudeAiOauth'
     if ($null -eq $oauth) { return $false }
     $expiresMs = Get-PropertyOrNull $oauth 'expiresAt'
@@ -198,8 +434,9 @@ function Test-ClaudeTokenValid {
 
 function Get-ClaudeUsage {
     $result = New-UsageResult -Name 'Claude'
+    if (Test-SourceUnavailable -Service 'Claude' -Result $result) { return $result }
     try {
-        $cred = Read-JsonFile $script:Config.ClaudeCredentials
+        $cred = Read-JsonFile $script:Sources.Claude.TokenFile
         $oauth = Get-PropertyOrNull $cred 'claudeAiOauth'
         if ($null -eq $oauth) {
             $result.Message = 'credentials not found'
@@ -248,7 +485,7 @@ function Test-CodexTokenValid {
     # Returns $true when the stored access token (a JWT) is not yet expired.
     # A token whose expiry cannot be decoded is treated as valid so that the
     # API response (401) remains the final authority.
-    $auth = Read-JsonFile $script:Config.CodexAuth
+    $auth = Read-JsonFile $script:Sources.Codex.TokenFile
     $tokens = Get-PropertyOrNull $auth 'tokens'
     if ($null -eq $tokens) { return $false }
     $expiresAt = Get-JwtExpiry (Get-PropertyOrNull $tokens 'access_token')
@@ -258,8 +495,9 @@ function Test-CodexTokenValid {
 
 function Get-CodexUsage {
     $result = New-UsageResult -Name 'Codex'
+    if (Test-SourceUnavailable -Service 'Codex' -Result $result) { return $result }
     try {
-        $auth = Read-JsonFile $script:Config.CodexAuth
+        $auth = Read-JsonFile $script:Sources.Codex.TokenFile
         $tokens = Get-PropertyOrNull $auth 'tokens'
         if ($null -eq $tokens) {
             $result.Message = 'auth not found'
@@ -327,25 +565,40 @@ function Get-CapturedStderr {
     }
 }
 
-function Invoke-WslCommand {
-    # Runs a fixed command inside WSL with no visible window. Returns the exit
-    # code (-1 on timeout) and logs the tail of stderr so failures can be diagnosed.
-    param([string]$BashCommand, [int]$TimeoutSec = 120)
-    $argList = '-d {0} -u {1} -- bash -lc "{2}"' -f $script:Config.WslDistro, $script:Config.WslUser, $BashCommand
+function Invoke-CliCommand {
+    # Runs a CLI command where that service keeps its tokens: inside WSL for a
+    # wsl source, directly on Windows for a windows source. No visible window.
+    # Returns the exit code (-1 on timeout, -2 when the service has no runnable
+    # source) and logs the tail of stderr so failures can be diagnosed.
+    param([string]$Service, [string]$Command, [int]$TimeoutSec = 120)
+
+    $kind = $script:Sources[$Service].Kind
+    if ($kind -eq 'wsl') {
+        $exe = 'wsl.exe'
+        $argList = '-d {0} -u {1} -- bash -lc "{2}"' -f $script:Wsl.Distro, $script:Wsl.User, $Command
+        # wsl.exe writes UTF-16 to redirected handles unless told otherwise.
+        $env:WSL_UTF8 = '1'
+    } elseif ($kind -eq 'windows') {
+        # cmd.exe resolves the CLI through PATH, which covers both an npm shim
+        # (claude.cmd) and a native executable.
+        $exe = 'cmd.exe'
+        $argList = '/c {0}' -f $Command
+    } else {
+        return -2
+    }
+
     if (-not (Test-Path $script:Config.StateDir)) {
         New-Item -ItemType Directory -Path $script:Config.StateDir -Force | Out-Null
     }
     # Unique per call: a file left locked by a killed process must not break
     # the next call. Stale files from earlier runs are swept opportunistically.
     try {
-        Get-ChildItem -LiteralPath $script:Config.StateDir -Filter 'wsl-stderr-*.txt' -ErrorAction SilentlyContinue |
+        Get-ChildItem -LiteralPath $script:Config.StateDir -Filter '*stderr-*.txt' -ErrorAction SilentlyContinue |
             Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-1) } |
             Remove-Item -Force -ErrorAction SilentlyContinue
     } catch { }
-    $errFile = Join-Path $script:Config.StateDir ('wsl-stderr-{0}-{1}.txt' -f $PID, [Guid]::NewGuid().ToString('N').Substring(0, 8))
-    # wsl.exe writes UTF-16 to redirected handles unless told otherwise.
-    $env:WSL_UTF8 = '1'
-    $proc = Start-Process -FilePath 'wsl.exe' -ArgumentList $argList -WindowStyle Hidden -PassThru `
+    $errFile = Join-Path $script:Config.StateDir ('cli-stderr-{0}-{1}.txt' -f $PID, [Guid]::NewGuid().ToString('N').Substring(0, 8))
+    $proc = Start-Process -FilePath $exe -ArgumentList $argList -WindowStyle Hidden -PassThru `
         -RedirectStandardError $errFile
     # Touch Handle so that ExitCode is populated after exit (PowerShell 5.1 quirk).
     $null = $proc.Handle
@@ -356,7 +609,7 @@ function Invoke-WslCommand {
         $code = $proc.ExitCode
     }
     $stderr = Get-CapturedStderr $errFile
-    if ($stderr) { Write-Log ("wsl stderr [{0}]: {1}" -f $BashCommand, $stderr) }
+    if ($stderr) { Write-Log ("{0} stderr [{1}]: {2}" -f $kind, $Command, $stderr) }
     return $code
 }
 
@@ -379,7 +632,7 @@ function Invoke-ClaudeTokenRefresh {
     if (-not (Test-RefreshAllowed -Name 'Claude')) { return $false }
 
     Write-Log 'claude token expired; sending one minimal headless message'
-    $code = Invoke-WslCommand -BashCommand 'claude -p ok --model haiku' -TimeoutSec 180
+    $code = Invoke-CliCommand -Service 'Claude' -Command 'claude -p ok --model haiku' -TimeoutSec 180
     Write-Log ("claude -p exit={0}" -f $code)
     $ok = Test-ClaudeTokenValid
     Write-Log ("claude token valid after ping={0}" -f $ok)
@@ -395,7 +648,7 @@ function Invoke-CodexTokenRefresh {
     if (-not (Test-RefreshAllowed -Name 'Codex')) { return $false }
 
     Write-Log 'codex token expired; trying "codex doctor --summary"'
-    $code = Invoke-WslCommand -BashCommand 'codex doctor --summary' -TimeoutSec 120
+    $code = Invoke-CliCommand -Service 'Codex' -Command 'codex doctor --summary' -TimeoutSec 120
     Write-Log ("codex doctor exit={0}" -f $code)
     $ok = Test-CodexTokenValid
     Write-Log ("codex token valid after doctor={0}" -f $ok)
@@ -598,11 +851,37 @@ function Update-AllServices {
 }
 
 # ---------------------------------------------------------------------------
-# Mode: -Stop
+# Mode: -Stop (the only mode that needs no token configuration)
 # ---------------------------------------------------------------------------
 if ($Stop) {
     $stopped = Stop-ExistingInstance
     if ($stopped) { Write-Output 'stopped' } else { Write-Output 'not running' }
+    exit 0
+}
+
+# Every mode below reads tokens, so the layout has to be settled first. A
+# service turned off is dropped here and is neither fetched nor drawn.
+Resolve-TokenSources -Redetect:$Configure
+$script:ActiveServices = @(@('Claude', 'Codex') | Where-Object { $script:Sources[$_].Kind -ne 'off' })
+
+# ---------------------------------------------------------------------------
+# Mode: -Configure (reports paths and source kinds; never a token value)
+# ---------------------------------------------------------------------------
+if ($Configure) {
+    [ordered]@{
+        config_file = $script:Config.ConfigFile
+        wsl         = [ordered]@{ distro = $script:Wsl.Distro; user = $script:Wsl.User }
+        services    = [ordered]@{
+            claude = [ordered]@{
+                source     = $script:Sources.Claude.Kind
+                token_file = $script:Sources.Claude.TokenFile
+            }
+            codex  = [ordered]@{
+                source     = $script:Sources.Codex.Kind
+                token_file = $script:Sources.Codex.TokenFile
+            }
+        }
+    } | ConvertTo-Json -Depth 5
     exit 0
 }
 
@@ -837,7 +1116,7 @@ $script:WindowTags['7d'].Brush = $script:Colors.Tag7d
 
 $script:Views = @{}
 $rowIndex = 0
-foreach ($name in @('Claude', 'Codex')) {
+foreach ($name in $script:ActiveServices) {
     if ($rowIndex -gt 0) {
         Add-ToGrid $grid (New-Separator) $rowIndex 0 3
         $rowIndex++
@@ -998,16 +1277,16 @@ function Update-ServiceView {
         'expired' { $view.Status.Text = '토큰 만료' }
         'stale'   { $view.Status.Text = '캐시된 값' }
         'init'    { $view.Status.Text = '' }
+        'unset'   { $view.Status.Text = '설정 필요' }
         default   { $view.Status.Text = '오류: ' + $s.Message }
     }
     $view.Status.Foreground = $(if ($s.Status -eq 'ok' -or $s.Status -eq 'init') { $script:Colors.Dim } else { $script:Colors.Warn })
 }
 
 function Update-View {
-    Update-ServiceView 'Claude'
-    Update-ServiceView 'Codex'
+    foreach ($name in $script:ActiveServices) { Update-ServiceView $name }
     $times = @()
-    foreach ($name in @('Claude', 'Codex')) {
+    foreach ($name in $script:ActiveServices) {
         $u = $script:Services[$name].UpdatedAt
         if ($null -ne $u) { $times += $u }
     }
