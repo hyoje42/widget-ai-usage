@@ -4,15 +4,28 @@
 
 .DESCRIPTION
     Idempotent. Copies the widget script to %LOCALAPPDATA%\ai-usage-widget,
-    registers a Startup shortcut so the widget launches at login, stops any
-    running instance, and starts the freshly installed version.
+    detects where the Claude Code and Codex CLIs keep their tokens, registers a
+    Startup shortcut so the widget launches at login, stops any running
+    instance, and starts the freshly installed version.
+
+    A fresh clone needs no editing: token locations are detected here and cached
+    in config.json beside the state file.
 
 .PARAMETER NoStart
     Install without launching the widget.
+
+.PARAMETER WslDistro
+    Name of the WSL distribution holding the CLI tokens. Pass it only when
+    detection picks the wrong one; it is found automatically otherwise.
+
+.PARAMETER WslUser
+    Linux user whose home holds the CLI tokens. Detected when omitted.
 #>
 [CmdletBinding()]
 param(
-    [switch]$NoStart
+    [switch]$NoStart,
+    [string]$WslDistro = '',
+    [string]$WslUser = ''
 )
 
 Set-StrictMode -Version 2.0
@@ -48,6 +61,22 @@ if (Test-Path $widget) {
 foreach ($file in @('ai-usage-widget.ps1', 'uninstall.ps1', 'ai-usage-widget.ico')) {
     Copy-Item -LiteralPath (Join-Path $source $file) -Destination (Join-Path $installDir $file) -Force
     Write-Output "Copied:  $file"
+}
+
+# Detect where each CLI keeps its tokens and cache the answer, so the widget
+# never has a machine-specific path compiled into it. -Configure prints the
+# resolved layout: file paths and source kinds only, never a token value.
+$configureArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $widget, '-Configure')
+if ($WslDistro) { $configureArgs += @('-WslDistro', $WslDistro) }
+if ($WslUser)   { $configureArgs += @('-WslUser', $WslUser) }
+$layout = & $powershell @configureArgs
+Write-Output 'Token locations:'
+$layout | ForEach-Object { Write-Output "  $_" }
+if (($layout -join '') -match '"unset"') {
+    Write-Warning ('No tokens found for at least one service. Log in first ' +
+        '("claude" in WSL or Windows, "codex login"), then run this installer ' +
+        'again. To hide a service you do not use, set it to "off" in ' +
+        (Join-Path $installDir 'config.json') + '.')
 }
 
 # Shortcuts (overwritten on every install so argument changes propagate):
