@@ -60,7 +60,7 @@ $ErrorActionPreference = 'Stop'
 $script:Config = @{
     WindowTitle            = 'AI Usage Widget'
     StateDir               = (Join-Path $env:LOCALAPPDATA 'ai-usage-widget')
-    DefaultIntervalMinutes = 2
+    DefaultIntervalMinutes = 5
     IntervalChoices        = @(2, 5, 10)
     # Window transparency in percent. 0 is fully opaque; the highest choice
     # still has to stay readable over a bright desktop background.
@@ -68,6 +68,11 @@ $script:Config = @{
     TransparencyChoices    = @(0, 15, 30, 45)
     HttpTimeoutSec         = 15
     RefreshCooldownMinutes = 15
+    # After an HTTP 429 a service is skipped for this long, doubling per repeat.
+    # Timers fire a little early; a fetch due within the slack is not skipped.
+    BackoffMinMinutes      = 10
+    BackoffMaxMinutes      = 30
+    BackoffSlackSeconds    = 30
     BarWidth               = 150.0
     BarHeight              = 14.0
     LowRemaining           = 20
@@ -88,6 +93,12 @@ $script:Config.LogFile           = Join-Path $script:Config.StateDir 'widget.log
 $script:LastRefreshAttempt = @{
     Claude = [DateTimeOffset]::MinValue
     Codex  = [DateTimeOffset]::MinValue
+}
+
+# HTTP 429 backoff per service: no fetch before Until; Minutes is the last delay.
+$script:Backoff = @{
+    Claude = @{ Until = [DateTimeOffset]::MinValue; Minutes = 0 }
+    Codex  = @{ Until = [DateTimeOffset]::MinValue; Minutes = 0 }
 }
 
 # ---------------------------------------------------------------------------
@@ -387,8 +398,9 @@ function New-UsageResult {
     param([string]$Name)
     return [ordered]@{
         Name      = $Name
-        Status    = 'error'     # ok | expired | error | unset | off
+        Status    = 'error'     # ok | expired | error | unset | off | backoff
         Message   = ''
+        HttpCode  = 0
         FiveHour  = [ordered]@{ Remaining = $null; ResetsAt = $null }
         SevenDay  = [ordered]@{ Remaining = $null; ResetsAt = $null }
         FetchedAt = $null
@@ -475,6 +487,7 @@ function Get-ClaudeUsage {
         $result.FetchedAt = [DateTimeOffset]::UtcNow
     } catch {
         $code = Get-HttpStatusCode $_
+        $result.HttpCode = $code
         if ($code -eq 401) {
             $result.Status = 'expired'
             $result.Message = 'token rejected (401)'
@@ -536,6 +549,7 @@ function Get-CodexUsage {
         $result.FetchedAt = [DateTimeOffset]::UtcNow
     } catch {
         $code = Get-HttpStatusCode $_
+        $result.HttpCode = $code
         if ($code -eq 401) {
             $result.Status = 'expired'
             $result.Message = 'token rejected (401)'
@@ -679,6 +693,11 @@ $script:Services = @{
 
 function Merge-UsageResult {
     param([hashtable]$State, $Result)
+    if ($Result.Status -eq 'backoff') {
+        # No request was made: keep what the last one said.
+        Update-LocalResets -State $State
+        return
+    }
     $State.Status  = $Result.Status
     $State.Message = $Result.Message
     if ($Result.Status -eq 'ok') {
@@ -834,22 +853,60 @@ function Write-PidFile {
 # ---------------------------------------------------------------------------
 # Fetch orchestration
 # ---------------------------------------------------------------------------
-function Update-AllServices {
-    param([switch]$AllowRefresh)
+function Get-BackoffResult {
+    # The result standing in for a fetch while a service waits out an HTTP 429
+    # backoff, or $null when the service may be fetched.
+    param([string]$Name)
+    $until = $script:Backoff[$Name].Until
+    if ([DateTimeOffset]::UtcNow.AddSeconds($script:Config.BackoffSlackSeconds) -ge $until) { return $null }
+    $result = New-UsageResult -Name $Name
+    $result.Status = 'backoff'
+    $result.Message = 'waiting after http 429'
+    return $result
+}
 
-    $claude = Get-ClaudeUsage
-    if ($AllowRefresh -and $claude.Status -eq 'expired') {
-        if (Invoke-ClaudeTokenRefresh) {
-            $claude = Get-ClaudeUsage
+function Update-Backoff {
+    # Starts or doubles the backoff on HTTP 429 (capped); a success clears it.
+    param([string]$Name, $Result)
+    $wait = $script:Backoff[$Name]
+    if ($Result.HttpCode -eq 429) {
+        $wait.Minutes = [math]::Min([math]::Max($wait.Minutes * 2, $script:Config.BackoffMinMinutes),
+                                    $script:Config.BackoffMaxMinutes)
+        $wait.Until = [DateTimeOffset]::UtcNow.AddMinutes($wait.Minutes)
+        Write-Log ("{0} http 429; next try in {1}m" -f $Name.ToLower(), $wait.Minutes)
+    } elseif ($Result.Status -eq 'ok') {
+        $wait.Minutes = 0
+        $wait.Until = [DateTimeOffset]::MinValue
+    }
+}
+
+function Update-AllServices {
+    # -UseBackoff is for the widget only; one-shot modes always fetch.
+    param([switch]$AllowRefresh, [switch]$UseBackoff)
+
+    $claude = $null
+    if ($UseBackoff) { $claude = Get-BackoffResult -Name 'Claude' }
+    if ($null -eq $claude) {
+        $claude = Get-ClaudeUsage
+        if ($AllowRefresh -and $claude.Status -eq 'expired') {
+            if (Invoke-ClaudeTokenRefresh) {
+                $claude = Get-ClaudeUsage
+            }
         }
+        if ($UseBackoff) { Update-Backoff -Name 'Claude' -Result $claude }
     }
     Merge-UsageResult -State $script:Services.Claude -Result $claude
 
-    $codex = Get-CodexUsage
-    if ($AllowRefresh -and $codex.Status -eq 'expired') {
-        if (Invoke-CodexTokenRefresh) {
-            $codex = Get-CodexUsage
+    $codex = $null
+    if ($UseBackoff) { $codex = Get-BackoffResult -Name 'Codex' }
+    if ($null -eq $codex) {
+        $codex = Get-CodexUsage
+        if ($AllowRefresh -and $codex.Status -eq 'expired') {
+            if (Invoke-CodexTokenRefresh) {
+                $codex = Get-CodexUsage
+            }
         }
+        if ($UseBackoff) { Update-Backoff -Name 'Codex' -Result $codex }
     }
     Merge-UsageResult -State $script:Services.Codex -Result $codex
 
@@ -1316,7 +1373,7 @@ function Invoke-FetchAndRender {
     # Flush the render queue so the "updating..." text is visible during the fetch.
     $script:Window.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Render)
     try {
-        Update-AllServices -AllowRefresh | Out-Null
+        Update-AllServices -AllowRefresh -UseBackoff | Out-Null
     } catch {
         Write-Log ("fetch failed: {0}" -f $_.Exception.Message)
     }

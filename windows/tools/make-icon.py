@@ -6,7 +6,8 @@ here in WSL with the standard library only and committed to the repository.
 Shapes are drawn from signed distance fields, which gives clean antialiasing
 without supersampling. Colours mirror the widget UI palette.
 
-Usage: python3 tools/make-icon.py [output.ico]
+Usage: python3 tools/make-icon.py [output.ico | output.png]
+A .png path writes a single 256px image (used by linux/ for its .desktop entry).
 """
 
 import math
@@ -172,6 +173,12 @@ def to_bmp(rgba, size):
 
 
 def build(path):
+    if path.lower().endswith(".png"):
+        with open(path, "wb") as fh:
+            fh.write(to_png(render(256), 256))
+        print("wrote {0} ({1} bytes)".format(path, os.path.getsize(path)))
+        return
+
     entries = []
     for size in SIZES:
         rgba = render(size)
