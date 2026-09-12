@@ -26,6 +26,15 @@ An always-on-top widget on the Windows desktop. Developed in WSL (Ubuntu), run o
   `cmd.exe` resolves both npm's `claude.cmd` and native executables on PATH.
 - The widget is always `Topmost`, so a second launch does not bring the existing window forward.
   Use `-Force` only when an install must replace the running instance.
+- **Tray icon.** WPF has no tray API, so it is a WinForms `NotifyIcon` with a `ContextMenuStrip`:
+  a WPF `ContextMenu` cannot be attached to a `NotifyIcon`, and one opened by hand from the tray
+  does not close on an outside click. The tray menu duplicates the window menu; both call the same
+  `Set-*` functions, which tick the matching entry in each. The tooltip shows remaining percent
+  (`NotifyIcon.Text` throws above 63 characters). Dispose the icon in `Closing`, or a ghost stays
+  in the tray. Windows puts a new icon in the overflow area; the `tray icon ready` log line is the
+  only proof it was created.
+- **`WidgetHidden` in state.json.** Hiding leaves the tray icon as the only way back, so the choice
+  survives a restart.
 - `config.json` holds the WSL distro and Linux username. It is personal info, so it stays out of the repo (root AGENTS.md §5).
 
 ## 3. Environment facts
@@ -57,6 +66,9 @@ Machine-specific values (usernames, distro names, absolute paths) come from auto
 - Under `$ErrorActionPreference = 'Stop'`, an exception in a timer tick or event handler silently kills
   the process. Wrap every handler in try/catch with `Write-Log`, and keep a `Dispatcher.UnhandledException` handler as the last safety net.
 - A window with `WS_EX_TOOLWINDOW` has an empty `Process.MainWindowTitle`; detect the running instance via `widget.pid`.
+- **Never show the window with `ShowDialog`.** Hiding a modal window ends its dialog loop, which would
+  quit the widget. Use `Show()` plus `[System.Windows.Threading.Dispatcher]::Run()`, and call
+  `InvokeShutdown()` in `Closed` so the process exits.
 - `Window.DragMove()` blocks until the drag ends and swallows `MouseLeftButtonUp`; save the position right after it returns.
 - Don't use automatic variables (`$host`, `$input`, `$args`, ...) as local variable names.
 - Use FontFamily `'Segoe UI, Malgun Gothic'` for Hangul fallback.
