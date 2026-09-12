@@ -729,6 +729,8 @@ $script:Settings = @{
     Top                 = $null
     IntervalMinutes     = $script:Config.DefaultIntervalMinutes
     TransparencyPercent = $script:Config.DefaultTransparency
+    # Hidden means only the tray icon is left; the window itself still exists.
+    WidgetHidden        = $false
 }
 
 function ConvertTo-IsoOrNull { param($Value) if ($null -eq $Value) { $null } else { $Value.ToString('o') } }
@@ -753,6 +755,7 @@ function Save-State {
             Top                 = $script:Settings.Top
             IntervalMinutes     = $script:Settings.IntervalMinutes
             TransparencyPercent = $script:Settings.TransparencyPercent
+            WidgetHidden        = $script:Settings.WidgetHidden
             Services            = $services
         }
         $json = $state | ConvertTo-Json -Depth 5
@@ -780,6 +783,9 @@ function Load-State {
         if ($null -ne $tp -and ($script:Config.TransparencyChoices -contains [int]$tp)) {
             $script:Settings.TransparencyPercent = [int]$tp
         }
+
+        $hidden = Get-PropertyOrNull $state 'WidgetHidden'
+        if ($null -ne $hidden) { $script:Settings.WidgetHidden = [bool]$hidden }
 
         $services = Get-PropertyOrNull $state 'Services'
         foreach ($name in @('Claude', 'Codex')) {
@@ -988,7 +994,17 @@ if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
     exit 1
 }
 
-Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml
+# System.Windows.Forms and System.Drawing are only for the tray icon: WPF has
+# no tray API of its own.
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml,
+    System.Windows.Forms, System.Drawing
+
+# Declared up front so the render path can touch them before the tray is built.
+$script:TrayIcon              = $null
+$script:TrayShowItem          = $null
+$script:TrayIntervalItems     = @()
+$script:TrayTransparencyItems = @()
+
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 # Hide the window from Alt+Tab by setting WS_EX_TOOLWINDOW.
@@ -1366,6 +1382,7 @@ function Update-View {
     } else {
         $script:Views.Footer.Text = ('데이터 없음  ·  {0}분마다' -f $script:Settings.IntervalMinutes)
     }
+    Update-TrayTooltip
 }
 
 function Invoke-FetchAndRender {
@@ -1412,6 +1429,7 @@ function Set-FetchInterval {
     $script:Settings.IntervalMinutes = $Minutes
     $script:FetchTimer.Interval = [TimeSpan]::FromMinutes($Minutes)
     foreach ($item in $script:IntervalItems) { $item.IsChecked = ([int]$item.Tag -eq $Minutes) }
+    foreach ($trayItem in $script:TrayIntervalItems) { $trayItem.Checked = ([int]$trayItem.Tag -eq $Minutes) }
     Update-View
     Save-State
     Write-Log ("interval set to {0}m" -f $Minutes)
@@ -1422,9 +1440,142 @@ function Set-WindowTransparency {
     $script:Settings.TransparencyPercent = $Percent
     $script:Window.Opacity = (100 - $Percent) / 100
     foreach ($item in $script:TransparencyItems) { $item.IsChecked = ([int]$item.Tag -eq $Percent) }
+    foreach ($trayItem in $script:TrayTransparencyItems) { $trayItem.Checked = ([int]$trayItem.Tag -eq $Percent) }
     Save-State
     Write-Log ("transparency set to {0}%" -f $Percent)
 }
+
+function Set-WidgetVisible {
+    # Hiding leaves the tray icon as the only way back, so the choice is saved:
+    # a widget hidden on purpose stays hidden across restarts.
+    param([bool]$Visible)
+    if ($Visible) {
+        $script:Window.Visibility = 'Visible'
+        $script:Window.Topmost = $true
+    } else {
+        $script:Settings.Left = $script:Window.Left
+        $script:Settings.Top  = $script:Window.Top
+        $script:Window.Visibility = 'Hidden'
+    }
+    $script:Settings.WidgetHidden = (-not $Visible)
+    if ($null -ne $script:TrayShowItem) { $script:TrayShowItem.Checked = $Visible }
+    Save-State
+    if ($Visible) { Write-Log 'widget shown' } else { Write-Log 'widget hidden' }
+}
+
+# ---------------------------------------------------------------------------
+# Tray icon
+# ---------------------------------------------------------------------------
+# The menu has to be a WinForms ContextMenuStrip: a WPF ContextMenu cannot be
+# attached to a NotifyIcon, and one opened by hand from the tray does not close
+# on an outside click. Both menus call the same Set-* functions, which tick the
+# matching entry in each.
+function New-TrayIconImage {
+    $icoPath = Join-Path $PSScriptRoot 'ai-usage-widget.ico'
+    if (Test-Path $icoPath) {
+        try {
+            $size = [System.Windows.Forms.SystemInformation]::SmallIconSize
+            return New-Object System.Drawing.Icon $icoPath, $size.Width, $size.Height
+        } catch {
+            Write-Log ("tray icon load failed: {0}" -f $_.Exception.Message)
+        }
+    }
+    return [System.Drawing.SystemIcons]::Application
+}
+
+function Update-TrayTooltip {
+    # NotifyIcon.Text throws above 63 characters, so keep the lines short.
+    if ($null -eq $script:TrayIcon) { return }
+    $lines = @()
+    foreach ($name in $script:ActiveServices) {
+        $s = $script:Services[$name]
+        $five = '--'
+        $seven = '--'
+        if ($null -ne $s.Remaining5) { $five = ('{0}%' -f [int]$s.Remaining5) }
+        if ($null -ne $s.Remaining7) { $seven = ('{0}%' -f [int]$s.Remaining7) }
+        $lines += ('{0} 5h {1} / 7d {2}' -f $name, $five, $seven)
+    }
+    if ($lines.Count -eq 0) { $lines = @($script:Config.WindowTitle) }
+    $text = ($lines -join [Environment]::NewLine)
+    if ($text.Length -gt 63) { $text = $text.Substring(0, 63) }
+    try { $script:TrayIcon.Text = $text } catch { }
+}
+
+$trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
+$trayMenu.ShowImageMargin = $false
+
+$script:TrayShowItem = New-Object System.Windows.Forms.ToolStripMenuItem '위젯 보이기'
+$script:TrayShowItem.Checked = (-not $script:Settings.WidgetHidden)
+$script:TrayShowItem.Add_Click({
+    try { Set-WidgetVisible (-not $script:TrayShowItem.Checked) }
+    catch { Write-Log ("tray toggle failed: {0}" -f $_.Exception.Message) }
+})
+$trayMenu.Items.Add($script:TrayShowItem) | Out-Null
+
+$trayRefresh = New-Object System.Windows.Forms.ToolStripMenuItem '지금 갱신'
+$trayRefresh.Add_Click({
+    try { Invoke-FetchAndRender } catch { Write-Log ("tray refresh failed: {0}" -f $_.Exception.Message) }
+})
+$trayMenu.Items.Add($trayRefresh) | Out-Null
+
+$trayInterval = New-Object System.Windows.Forms.ToolStripMenuItem '갱신 주기'
+foreach ($m in $script:Config.IntervalChoices) {
+    $trayChoice = New-Object System.Windows.Forms.ToolStripMenuItem ('{0}분' -f $m)
+    $trayChoice.Tag = $m
+    $trayChoice.Checked = ($m -eq $script:Settings.IntervalMinutes)
+    $trayChoice.Add_Click({
+        param($sender, $e)
+        try { Set-FetchInterval -Minutes ([int]$sender.Tag) }
+        catch { Write-Log ("tray interval failed: {0}" -f $_.Exception.Message) }
+    })
+    $trayInterval.DropDownItems.Add($trayChoice) | Out-Null
+    $script:TrayIntervalItems += $trayChoice
+}
+$trayMenu.Items.Add($trayInterval) | Out-Null
+
+$trayTransparency = New-Object System.Windows.Forms.ToolStripMenuItem '투명도'
+foreach ($t in $script:Config.TransparencyChoices) {
+    if ($t -eq 0) { $trayLabel = '없음' } else { $trayLabel = ('{0}%' -f $t) }
+    $trayChoice = New-Object System.Windows.Forms.ToolStripMenuItem $trayLabel
+    $trayChoice.Tag = $t
+    $trayChoice.Checked = ($t -eq $script:Settings.TransparencyPercent)
+    $trayChoice.Add_Click({
+        param($sender, $e)
+        try { Set-WindowTransparency -Percent ([int]$sender.Tag) }
+        catch { Write-Log ("tray transparency failed: {0}" -f $_.Exception.Message) }
+    })
+    $trayTransparency.DropDownItems.Add($trayChoice) | Out-Null
+    $script:TrayTransparencyItems += $trayChoice
+}
+$trayMenu.Items.Add($trayTransparency) | Out-Null
+
+$trayMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+
+$trayExit = New-Object System.Windows.Forms.ToolStripMenuItem '종료'
+$trayExit.Add_Click({
+    try { $script:Window.Close() } catch { Write-Log ("tray exit failed: {0}" -f $_.Exception.Message) }
+})
+$trayMenu.Items.Add($trayExit) | Out-Null
+
+$script:TrayIcon = New-Object System.Windows.Forms.NotifyIcon
+$script:TrayIcon.Icon = New-TrayIconImage
+$script:TrayIcon.Text = $script:Config.WindowTitle
+$script:TrayIcon.ContextMenuStrip = $trayMenu
+$script:TrayIcon.Visible = $true
+# Windows puts a new tray icon in the overflow area, so the log is the only
+# proof it was created at all.
+Write-Log 'tray icon ready'
+$script:TrayIcon.Add_MouseClick({
+    # Left click toggles the widget; the right button opens ContextMenuStrip.
+    param($sender, $e)
+    try {
+        if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+            Set-WidgetVisible ($script:Window.Visibility -ne [System.Windows.Visibility]::Visible)
+        }
+    } catch {
+        Write-Log ("tray click failed: {0}" -f $_.Exception.Message)
+    }
+})
 
 # ---------------------------------------------------------------------------
 # Context menu
@@ -1474,6 +1625,13 @@ foreach ($t in $script:Config.TransparencyChoices) {
 }
 $menu.Items.Add($miTransparency) | Out-Null
 
+$miHide = New-Object System.Windows.Controls.MenuItem
+$miHide.Header = '숨기기 (트레이에 유지)'
+$miHide.Add_Click({
+    try { Set-WidgetVisible $false } catch { Write-Log ("hide failed: {0}" -f $_.Exception.Message) }
+})
+$menu.Items.Add($miHide) | Out-Null
+
 $menu.Items.Add((New-Object System.Windows.Controls.Separator)) | Out-Null
 
 $miExit = New-Object System.Windows.Controls.MenuItem
@@ -1511,6 +1669,7 @@ $script:Window.Add_SourceInitialized({
 
 $script:Window.Add_ContentRendered({
     Set-InitialPosition
+    if ($script:Settings.WidgetHidden) { Set-WidgetVisible $false }
     Update-View
     Invoke-FetchAndRender
     $script:FetchTimer.Start()
@@ -1520,6 +1679,11 @@ $script:Window.Add_ContentRendered({
 $script:Window.Add_Closing({
     $script:FetchTimer.Stop()
     $script:TickTimer.Stop()
+    if ($null -ne $script:TrayIcon) {
+        $script:TrayIcon.Visible = $false
+        $script:TrayIcon.Dispose()
+        $script:TrayIcon = $null
+    }
     $script:Settings.Left = $script:Window.Left
     $script:Settings.Top  = $script:Window.Top
     Save-State
@@ -1534,5 +1698,12 @@ $script:Window.Add_Closing({
     $e.Handled = $true
 })
 
+# ShowDialog is not usable here: hiding a modal window ends its dialog loop and
+# would quit the widget, so the window is shown and the dispatcher run by hand.
+$script:Window.Add_Closed({
+    [System.Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown()
+})
+
 Update-View
-$script:Window.ShowDialog() | Out-Null
+$script:Window.Show()
+[System.Windows.Threading.Dispatcher]::Run()
