@@ -17,6 +17,12 @@ Rules for the Linux implementation. Follow them together with the root [AGENTS.m
 - `core.py` must not import GTK, so `--fetch-only`, `--configure` and `--stop` work without a display.
 - Fetches run on a worker thread; results reach widgets only through `GLib.idle_add` on the main thread.
 - Token files: `$CLAUDE_CONFIG_DIR` / `$CODEX_HOME` when set, else `~/.claude`, `~/.codex`.
+- **Proxy** (2026-10-01): an autostarted widget has no shell proxy variables, so every request and the refresh CLI's
+  environment go through `desktop_proxy()` in `core.py`. A proxy variable for the URL's scheme wins; otherwise Gio's
+  `ProxyResolver` decides (GNOME settings, changes picked up while the GTK main loop runs). An `http://` proxy that
+  refuses a TCP connect within 3 s is skipped for direct; other kinds (socks) go direct, as urllib cannot use them.
+  The log records `network route:` only when the route changes. GNOME `auto` (PAC) mode and non-GNOME desktops are
+  not verified; the user chose not to target other desktops.
 - CLI paths are detected (`shutil.which`, then `$SHELL -lic 'command -v <cli>'`, then common install dirs) and cached in
   `config.json`, because an autostarted session lacks the PATH nvm adds in `~/.bashrc`. Refresh runs the cached path
   with its directory prepended to PATH (npm CLIs are `#!/usr/bin/env node` scripts) and the state dir as cwd, so
@@ -65,6 +71,8 @@ setsid -f /usr/bin/python3 ai-usage-widget.py --force </dev/null >/dev/null 2>&1
 /usr/bin/python3 tools/capture-widget.py --wait 15 # PNG of the window; prints its geometry
 ```
 
+- Proxy route without touching the user's settings: run with `GSETTINGS_BACKEND=memory` (mode `none`, set keys in-process
+  with `Gio.Settings`) and `XDG_STATE_HOME` pointing at a scratch dir so the real log stays clean.
 - A launch without `setsid -f` blocks while the widget lives. Rapid restarts trip HTTP 429 (root AGENTS.md §3).
 - Check UI changes by viewing the captured PNG. On HiDPI it is in device pixels (this dev machine uses scale 2).
   Redirect the widget's stderr to a file when debugging a launch; GTK and Python errors go there, not to the log.

@@ -14,9 +14,11 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 APP = "ai-usage-widget"
@@ -37,6 +39,8 @@ INTERVAL_CHOICES = (2, 5, 10)
 DEFAULT_TRANSPARENCY = 0
 TRANSPARENCY_CHOICES = (0, 15, 30, 45)
 HTTP_TIMEOUT = 15
+PROXY_PROBE_TIMEOUT = 3
+NO_PROXY_HOSTS = "localhost,127.0.0.1,::1"
 REFRESH_COOLDOWN_SEC = 15 * 60
 # After an HTTP 429 a service is skipped for this long, doubling per repeat.
 BACKOFF_MIN_SEC, BACKOFF_MAX_SEC = 10 * 60, 30 * 60
@@ -53,9 +57,10 @@ USER_AGENT = APP
 SERVICES = ("Claude", "Codex")
 SPEC = {
     "Claude": {"key": "claude", "home_env": "CLAUDE_CONFIG_DIR", "home_dir": ".claude",
-               "token": ".credentials.json", "refresh": ["-p", "ok", "--model", "haiku"], "timeout": 180},
+               "token": ".credentials.json", "url": CLAUDE_USAGE_URL,
+               "refresh": ["-p", "ok", "--model", "haiku"], "timeout": 180},
     "Codex": {"key": "codex", "home_env": "CODEX_HOME", "home_dir": ".codex",
-              "token": "auth.json", "refresh": ["doctor", "--summary"], "timeout": 120},
+              "token": "auth.json", "url": CODEX_USAGE_URL, "refresh": ["doctor", "--summary"], "timeout": 120},
 }
 
 UTC = dt.timezone.utc
@@ -214,9 +219,63 @@ def format_countdown(resets_at, now=None, short=False):
     return "1분 이내"
 
 
+# ---------------------------------------------------------------------------
+# Proxy: an autostarted widget lacks the shell's proxy variables, so it also
+# asks the desktop settings (GNOME, through Gio) on every request
+# ---------------------------------------------------------------------------
+_route = None
+
+
+def _note_route(route):
+    global _route
+    if route != _route:
+        _route = route
+        log("network route: " + route)
+
+
+def _gio_proxy(url):
+    try:
+        import gi
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio, GLib
+    except (ImportError, ValueError):
+        return None
+    try:
+        found = Gio.ProxyResolver.get_default().lookup(url, None) or []
+    except GLib.Error:
+        return None
+    # urllib speaks only http proxies; anything else (socks, direct) goes direct.
+    return found[0] if found and found[0].startswith("http://") else None
+
+
+def desktop_proxy(url):
+    """The http proxy the desktop settings choose for url, or None to leave
+    the route to urllib. Proxy environment variables win, as urllib honours
+    them already; a proxy that refuses connections is skipped."""
+    # Only a proxy for the URL's scheme counts; NO_PROXY alone also shows up here.
+    if urllib.request.getproxies().get(urllib.parse.urlsplit(url).scheme):
+        _note_route("environment proxy")
+        return None
+    proxy = _gio_proxy(url)
+    if proxy:
+        shown = re.sub(r"//[^/@]*@", "//<auth>@", proxy)
+        try:
+            parts = urllib.parse.urlsplit(proxy)
+            socket.create_connection((parts.hostname, parts.port or 80), PROXY_PROBE_TIMEOUT).close()
+        except (OSError, ValueError, TypeError):
+            _note_route("direct (proxy %s unreachable)" % shown)
+            return None
+        _note_route("proxy " + shown)
+        return proxy
+    _note_route("direct")
+    return None
+
+
 def http_get_json(url, headers):
     request = urllib.request.Request(url, headers=dict(headers, **{"User-Agent": USER_AGENT}))
-    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+    proxy = desktop_proxy(url)
+    handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy else []
+    with urllib.request.build_opener(*handlers).open(request, timeout=HTTP_TIMEOUT) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -353,6 +412,12 @@ def run_cli(service, source, timeout):
     env = dict(os.environ)
     # An npm-installed CLI is a node script: keep its bin dir (holding node) on PATH.
     env["PATH"] = os.path.dirname(cli) + os.pathsep + env.get("PATH", "")
+    proxy = desktop_proxy(SPEC[service]["url"])
+    if proxy:
+        for name in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
+            env[name] = proxy
+        env.setdefault("NO_PROXY", NO_PROXY_HOSTS)
+        env.setdefault("no_proxy", NO_PROXY_HOSTS)
     os.makedirs(STATE_DIR, exist_ok=True)
     try:
         proc = subprocess.run([cli] + args, cwd=STATE_DIR, env=env, stdin=subprocess.DEVNULL,
