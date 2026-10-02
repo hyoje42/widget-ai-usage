@@ -22,8 +22,12 @@ An always-on-top widget on the Windows desktop. Developed in WSL (Ubuntu), run o
     `Test-PathSafe`, and `Get-FileWrittenAt` for file times.
   - Both the `wsl` and the `windows` source work in real environments (confirmed by the user, 2026-09-11).
 - The refresh CLI (root AGENTS.md §3) runs where the service's source is, for both services:
-  `wsl.exe -d <distro> -u <user> -- bash -lc "<cmd>"` for `wsl`, `cmd.exe /c <cmd>` for `windows`.
+  `wsl.exe -d <distro> -u <user> --exec bash -lc "<cmd>"` for `wsl`, `cmd.exe /c <cmd>` for `windows`.
   `cmd.exe` resolves both npm's `claude.cmd` and native executables on PATH.
+  - That login shell is non-interactive, so `~/.bashrc` returns early and an nvm-installed `codex` is not on
+    PATH (`exit=127`, 2026-10-02). The command is prefixed with a lookup (`command -v`, then `$SHELL -lic`,
+    then `~/.nvm/versions/node/*/bin`) that prepends the CLI's dir to PATH, like linux/ `find_cli`.
+    `--exec` keeps the default shell from expanding `$` in that prefix.
 - The widget is always `Topmost`, so a second launch does not bring the existing window forward.
   Use `-Force` only when an install must replace the running instance.
 - **Tray icon.** WPF has no tray API, so it is a WinForms `NotifyIcon` with a `ContextMenuStrip`:
