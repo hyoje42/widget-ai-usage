@@ -592,8 +592,18 @@ function Invoke-CliCommand {
 
     $kind = $script:Sources[$Service].Kind
     if ($kind -eq 'wsl') {
+        # A login shell started by wsl.exe is not interactive, so ~/.bashrc
+        # returns early and a CLI installed through nvm is not on PATH. Ask the
+        # interactive shell, then the nvm dirs, and put the CLI's dir (holding
+        # node for an npm CLI) first on PATH.
+        $cli = ($Command -split ' ')[0]
+        $bashCmd = ('c=$(command -v {0}); ' +
+            '[ -n "$c" ] || c=$("${{SHELL:-bash}}" -lic ''command -v {0}'' </dev/null 2>/dev/null | grep ^/ | tail -n 1); ' +
+            '[ -n "$c" ] || c=$(ls -t ~/.nvm/versions/node/*/bin/{0} 2>/dev/null | head -n 1); ' +
+            '[ -n "$c" ] && PATH="$(dirname "$c"):$PATH"; {1}') -f $cli, $Command
         $exe = 'wsl.exe'
-        $argList = '-d {0} -u {1} -- bash -lc "{2}"' -f $script:Wsl.Distro, $script:Wsl.User, $Command
+        # --exec skips the default shell, which would expand $ before bash -lc runs.
+        $argList = '-d {0} -u {1} --exec bash -lc "{2}"' -f $script:Wsl.Distro, $script:Wsl.User, $bashCmd.Replace('"', '\"')
         # wsl.exe writes UTF-16 to redirected handles unless told otherwise.
         $env:WSL_UTF8 = '1'
     } elseif ($kind -eq 'windows') {
