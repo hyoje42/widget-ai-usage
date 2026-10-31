@@ -376,15 +376,31 @@ def get_codex_usage(source):
         resp = http_get_json(CODEX_USAGE_URL, {"Authorization": "Bearer " + tokens["access_token"],
                                                "ChatGPT-Account-ID": str(tokens.get("account_id") or "")})
         limits = resp.get("rate_limit") if isinstance(resp, dict) else None
-        primary = limits.get("primary_window") if isinstance(limits, dict) else None
-        secondary = limits.get("secondary_window") if isinstance(limits, dict) else None
-        if not isinstance(primary, dict) or not isinstance(secondary, dict):
+        # Window positions vary for plans that only expose a weekly limit.
+        seen = set()
+        for key in ("primary_window", "secondary_window"):
+            data = limits.get(key) if isinstance(limits, dict) else None
+            if data is None:
+                continue
+            if not isinstance(data, dict):
+                result["message"] = "unexpected response shape"
+                return result
+            duration = data.get("limit_window_seconds")
+            window = ("five_hour" if duration == 18000 else
+                      "seven_day" if duration == 604800 else None)
+            if (window is None or window in seen or data.get("used_percent") is None
+                    or data.get("reset_at") is None):
+                result["message"] = "unexpected response shape"
+                return result
+            result[window]["remaining"] = to_remaining(data["used_percent"])
+            if result[window]["remaining"] is None:
+                result["message"] = "unexpected response shape"
+                return result
+            result[window]["resets_at"] = dt.datetime.fromtimestamp(int(data["reset_at"]), tz=UTC)
+            seen.add(window)
+        if not seen:
             result["message"] = "unexpected response shape"
             return result
-        for window, data in (("five_hour", primary), ("seven_day", secondary)):
-            result[window]["remaining"] = to_remaining(data.get("used_percent"))
-            reset = data.get("reset_at")
-            result[window]["resets_at"] = dt.datetime.fromtimestamp(int(reset), tz=UTC) if reset else None
         result.update(status="ok", fetched_at=now_utc())
     except (urllib.error.URLError, OSError, ValueError, TypeError) as exc:
         _fail(result, exc)

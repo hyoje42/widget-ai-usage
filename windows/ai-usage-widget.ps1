@@ -533,18 +533,32 @@ function Get-CodexUsage {
             -Method Get -TimeoutSec $script:Config.HttpTimeoutSec
 
         $rl = Get-PropertyOrNull $resp 'rate_limit'
-        $primary   = Get-PropertyOrNull $rl 'primary_window'
-        $secondary = Get-PropertyOrNull $rl 'secondary_window'
-        if ($null -eq $primary -or $null -eq $secondary) {
+        # A weekly-only plan can put the 7-day window in primary_window.
+        $seen = @{}
+        foreach ($key in @('primary_window', 'secondary_window')) {
+            $data = Get-PropertyOrNull $rl $key
+            if ($null -eq $data) { continue }
+            $duration = Get-PropertyOrNull $data 'limit_window_seconds'
+            $window = switch ($duration) {
+                18000  { 'FiveHour' }
+                604800 { 'SevenDay' }
+                default { $null }
+            }
+            $used = Get-PropertyOrNull $data 'used_percent'
+            $reset = Get-PropertyOrNull $data 'reset_at'
+            if ($null -eq $window -or $seen.ContainsKey($window) -or
+                $null -eq $used -or $null -eq $reset) {
+                $result.Message = 'unexpected response shape'
+                return $result
+            }
+            $result[$window].Remaining = ConvertTo-Remaining $used
+            $result[$window].ResetsAt = [DateTimeOffset]::FromUnixTimeSeconds([int64]$reset)
+            $seen[$window] = $true
+        }
+        if ($seen.Count -eq 0) {
             $result.Message = 'unexpected response shape'
             return $result
         }
-        $result.FiveHour.Remaining = ConvertTo-Remaining (Get-PropertyOrNull $primary 'used_percent')
-        $result.SevenDay.Remaining = ConvertTo-Remaining (Get-PropertyOrNull $secondary 'used_percent')
-        $r5 = Get-PropertyOrNull $primary 'reset_at'
-        $r7 = Get-PropertyOrNull $secondary 'reset_at'
-        if ($r5) { $result.FiveHour.ResetsAt = [DateTimeOffset]::FromUnixTimeSeconds([int64]$r5) }
-        if ($r7) { $result.SevenDay.ResetsAt = [DateTimeOffset]::FromUnixTimeSeconds([int64]$r7) }
         $result.Status = 'ok'
         $result.FetchedAt = [DateTimeOffset]::UtcNow
     } catch {
@@ -1354,7 +1368,7 @@ function Update-ServiceView {
         $fill = $view["Fill$win"]
         if ($null -eq $remaining) {
             $fill.Width = 0
-            $view["Label$win"].Text = '--'
+            $view["Label$win"].Text = $(if ($fresh) { 'N/A' } else { '--' })
         } else {
             $fill.Width = [math]::Max(0.0, $script:Config.BarWidth * ([double]$remaining / 100.0))
             $view["Label$win"].Text = ('{0}%' -f [int]$remaining)

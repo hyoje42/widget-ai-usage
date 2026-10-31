@@ -80,8 +80,11 @@ malformed, **show an error state** instead of throwing.
   use its `exp` claim (lifetime ~10 days; ignore `id_token`, 1 h). `last_refresh` is the CLI's last refresh time.
 - Request: `GET https://chatgpt.com/backend-api/wham/usage`
   - Headers: `Authorization: Bearer <access_token>`, `ChatGPT-Account-ID: <account_id>`
-- Fields: `rate_limit.primary_window.used_percent`, `rate_limit.primary_window.reset_at` (epoch s) for
-  the 5-hour window; same under `rate_limit.secondary_window` for the 7-day window.
+- Read `rate_limit.primary_window` and `secondary_window` by `limit_window_seconds`:
+  18000 = 5 hours, 604800 = 7 days; use `used_percent` and `reset_at` (epoch s).
+  A single window is valid (weekly-only primary and null secondary observed 2026-11-01).
+  Show an absent window as unavailable, never as 100% remaining. Empty, unknown-duration,
+  duplicate-duration, or malformed windows are errors.
 - The response includes `email`, `user_id`, `account_id`. **Never display or store them.**
 
 Displayed value: remaining percent = `100 - used%`.

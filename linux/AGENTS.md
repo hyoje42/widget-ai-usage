@@ -101,3 +101,6 @@ Checked on Ubuntu 24.04 GNOME, X11 session, 2026-09-11.
 - A clean login shell finds `claude` in `~/.local/bin` but not the nvm-installed `codex`.
 - Ubuntu 26.04 LTS removed the GNOME Xorg session, so XWayland is the only X11 path there.
 - Native Linux has no `powershell.exe`, so the Windows implementation cannot be run or verified here.
+
+- Codex single-window support (2026-11-01): mocked Plus/Pro responses pass in core.py;
+  GTK window and top bar rendering of the unavailable window still need verification on Linux.

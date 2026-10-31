@@ -434,7 +434,7 @@ class Widget(Gtk.Window):
                 css_class = bar_class(remaining, fresh)
                 if css_class:
                     bar_style.add_class(css_class)
-                percent = "--" if remaining is None else "%d%%" % remaining
+                percent = ("N/A" if fresh else "--") if remaining is None else "%d%%" % remaining
                 view["label" + window].set_text(percent)
                 text, color, bold = reset_presentation(state["reset" + number], fresh, window, now)
                 set_markup(view["reset" + window], text, color, bold)
