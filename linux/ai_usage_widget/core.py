@@ -326,14 +326,26 @@ def get_claude_usage(source):
         resp = http_get_json(CLAUDE_USAGE_URL, {"Authorization": "Bearer " + oauth["accessToken"],
                                                 "anthropic-beta": "oauth-2025-04-20",
                                                 "Content-Type": "application/json"})
-        five = resp.get("five_hour") if isinstance(resp, dict) else None
-        seven = resp.get("seven_day") if isinstance(resp, dict) else None
-        if not isinstance(five, dict) or not isinstance(seven, dict):
+        if not isinstance(resp, dict):
             result["message"] = "unexpected response shape"
             return result
-        for window, data in (("five_hour", five), ("seven_day", seven)):
-            result[window]["remaining"] = to_remaining(data.get("utilization"))
+        # Plans without a 5-hour limit can return a null window (or a null
+        # utilization); that window is shown as N/A, but one must be present.
+        seen = 0
+        for window in ("five_hour", "seven_day"):
+            data = resp.get(window)
+            if data is None or (isinstance(data, dict) and data.get("utilization") is None):
+                continue
+            remaining = to_remaining(data.get("utilization")) if isinstance(data, dict) else None
+            if remaining is None:
+                result["message"] = "unexpected response shape"
+                return result
+            result[window]["remaining"] = remaining
             result[window]["resets_at"] = parse_iso(data.get("resets_at"))
+            seen += 1
+        if not seen:
+            result["message"] = "unexpected response shape"
+            return result
         result.update(status="ok", fetched_at=now_utc())
     except (urllib.error.URLError, OSError, ValueError) as exc:
         _fail(result, exc)

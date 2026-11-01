@@ -471,18 +471,22 @@ function Get-ClaudeUsage {
         $resp = Invoke-RestMethod -Uri $script:Config.ClaudeUsageUrl -Headers $headers `
             -Method Get -TimeoutSec $script:Config.HttpTimeoutSec
 
-        $five  = Get-PropertyOrNull $resp 'five_hour'
-        $seven = Get-PropertyOrNull $resp 'seven_day'
-        if ($null -eq $five -or $null -eq $seven) {
+        # Plans without a 5-hour limit can return a null window (or a null
+        # utilization); that window is shown as N/A, but one must be present.
+        $seen = 0
+        foreach ($pair in @(@('five_hour', 'FiveHour'), @('seven_day', 'SevenDay'))) {
+            $data = Get-PropertyOrNull $resp $pair[0]
+            $used = Get-PropertyOrNull $data 'utilization'
+            if ($null -eq $used) { continue }
+            $result[$pair[1]].Remaining = ConvertTo-Remaining $used
+            $reset = Get-PropertyOrNull $data 'resets_at'
+            if ($reset) { $result[$pair[1]].ResetsAt = [DateTimeOffset]::Parse($reset) }
+            $seen++
+        }
+        if ($seen -eq 0) {
             $result.Message = 'unexpected response shape'
             return $result
         }
-        $result.FiveHour.Remaining = ConvertTo-Remaining (Get-PropertyOrNull $five 'utilization')
-        $result.SevenDay.Remaining = ConvertTo-Remaining (Get-PropertyOrNull $seven 'utilization')
-        $r5 = Get-PropertyOrNull $five 'resets_at'
-        $r7 = Get-PropertyOrNull $seven 'resets_at'
-        if ($r5) { $result.FiveHour.ResetsAt = [DateTimeOffset]::Parse($r5) }
-        if ($r7) { $result.SevenDay.ResetsAt = [DateTimeOffset]::Parse($r7) }
         $result.Status = 'ok'
         $result.FetchedAt = [DateTimeOffset]::UtcNow
     } catch {
@@ -1079,6 +1083,20 @@ $script:Colors = @{
     Tag7d      = New-Brush '#8B5CF6'
 }
 
+# N/A (the plan has no such window): steel-blue diagonal stripes, distinct from
+# the empty track of 0% left and from the good/warn/bad fills.
+$script:NotApplicableHatch = New-Object System.Windows.Media.LinearGradientBrush
+$script:NotApplicableHatch.MappingMode = 'Absolute'
+$script:NotApplicableHatch.SpreadMethod = 'Repeat'
+$script:NotApplicableHatch.StartPoint = New-Object System.Windows.Point 0, 0
+$script:NotApplicableHatch.EndPoint = New-Object System.Windows.Point 4, 4
+# Loop names must not collide with script params (-Stop): names are case-insensitive.
+foreach ($hatchStop in @(@('#5B7896', 0.0), @('#5B7896', 0.5), @('#34414F', 0.5), @('#34414F', 1.0))) {
+    $hatchColor = [System.Windows.Media.ColorConverter]::ConvertFromString($hatchStop[0])
+    $script:NotApplicableHatch.GradientStops.Add((New-Object System.Windows.Media.GradientStop $hatchColor, $hatchStop[1]))
+}
+$script:NotApplicableHatch.Freeze()
+
 function New-TextBlock {
     param([string]$Text = '', $Brush, [double]$Size = 12, [string]$Weight = 'Normal',
           [string]$HAlign = 'Left', [double]$Width = 0)
@@ -1250,6 +1268,7 @@ foreach ($name in $script:ActiveServices) {
         Add-ToGrid $grid $label     $rowIndex 0
         Add-ToGrid $grid $bar.Track $rowIndex 1
         Add-ToGrid $grid $reset     $rowIndex 2
+        $view["Track$win"] = $bar.Track
         $view["Fill$win"]  = $bar.Fill
         $view["Label$win"] = $bar.Label
         $view["Reset$win"] = $reset
@@ -1366,6 +1385,9 @@ function Update-ServiceView {
     foreach ($pair in @(@('5h', 'Remaining5', 'Reset5'), @('7d', 'Remaining7', 'Reset7'))) {
         $win = $pair[0]; $remaining = $s[$pair[1]]; $resetAt = $s[$pair[2]]
         $fill = $view["Fill$win"]
+        # A fresh response without this window means the plan has no such
+        # limit: hatch the whole track so it never reads as 0% left.
+        $view["Track$win"].Background = $(if ($fresh -and $null -eq $remaining) { $script:NotApplicableHatch } else { $script:Colors.Track })
         if ($null -eq $remaining) {
             $fill.Width = 0
             $view["Label$win"].Text = $(if ($fresh) { 'N/A' } else { '--' })
@@ -1513,8 +1535,9 @@ function Update-TrayTooltip {
     $lines = @()
     foreach ($name in $script:ActiveServices) {
         $s = $script:Services[$name]
-        $five = '--'
-        $seven = '--'
+        $none = $(if ($s.Status -eq 'ok') { 'N/A' } else { '--' })
+        $five = $none
+        $seven = $none
         if ($null -ne $s.Remaining5) { $five = ('{0}%' -f [int]$s.Remaining5) }
         if ($null -ne $s.Remaining7) { $seven = ('{0}%' -f [int]$s.Remaining7) }
         $lines += ('{0} 5h {1} / 7d {2}' -f $name, $five, $seven)

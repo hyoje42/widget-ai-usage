@@ -38,10 +38,10 @@ EDGE_MARGIN = 12
 
 # Text colours go through Pango markup; everything else lives in CSS below.
 COLORS = {"text": "#F0F0F0", "dim": "#9A9A9A", "good": "#4CAF50", "warn": "#FFC107",
-          "bad": "#F44336", "stale": "#707070"}
+          "bad": "#F44336", "stale": "#707070", "na": "#7F9CB8"}
 WINDOW_TAGS = {"5h": "5시간", "7d": "7일"}
 STATUS_TEXT = {"ok": "", "init": "", "expired": "토큰 만료", "stale": "캐시된 값", "unset": "설정 필요"}
-BAR_CLASSES = ("good", "warn", "bad")
+BAR_CLASSES = ("good", "warn", "bad", "na")
 
 # Scoped under the window's "aiw" class so the context menu keeps the theme.
 CSS = b"""
@@ -70,6 +70,10 @@ window.aiw.square { border-radius: 0; }
 .aiw progressbar.good progress { background-color: #4CAF50; }
 .aiw progressbar.warn progress { background-color: #FFC107; }
 .aiw progressbar.bad progress { background-color: #F44336; }
+/* N/A (the plan has no such window): steel-blue stripes, never an empty 0% bar. */
+.aiw progressbar.na trough {
+  background-image: repeating-linear-gradient(135deg, #5B7896 0px, #5B7896 2px, #34414F 2px, #34414F 4px);
+}
 .aiw .bar-label {
   font-size: 10px; font-weight: bold; color: #F0F0F0;
   text-shadow: 0 0 3px rgba(0, 0, 0, 0.9);
@@ -84,8 +88,10 @@ def set_markup(label, text, color, bold=False):
 
 
 def bar_class(remaining, fresh):
-    if remaining is None or not fresh:
+    if not fresh:
         return None  # Stale grey.
+    if remaining is None:
+        return "na"  # A fresh response without this window: the plan has no such limit.
     if remaining >= 50:
         return "good"
     return "warn" if remaining >= core.LOW_REMAINING else "bad"

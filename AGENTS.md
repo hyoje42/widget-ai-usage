@@ -74,6 +74,8 @@ malformed, **show an error state** instead of throwing.
 - Request: `GET https://api.anthropic.com/api/oauth/usage`
   - Headers: `Authorization: Bearer <accessToken>`, `anthropic-beta: oauth-2025-04-20`, `Content-Type: application/json`
 - Fields: `five_hour.utilization` (used %, 0-100), `five_hour.resets_at` (ISO 8601); same under `seven_day`.
+  Higher plans may have no 5-hour limit: a null/missing window or a null `utilization` means that window is absent
+  (same display rule as Codex below). Both absent or a non-numeric `utilization` is an error.
 
 ### Codex
 - Token: `~/.codex/auth.json` → `tokens.access_token`, `tokens.account_id`. The access token is a JWT;
@@ -87,7 +89,8 @@ malformed, **show an error state** instead of throwing.
   duplicate-duration, or malformed windows are errors.
 - The response includes `email`, `user_id`, `account_id`. **Never display or store them.**
 
-Displayed value: remaining percent = `100 - used%`.
+Displayed value: remaining percent = `100 - used%`. An absent window in a fresh response shows `N/A` on a
+steel-blue striped track (`$script:NotApplicableHatch`), never an empty bar that reads as 0% left.
 
 ### Logos
 - Claude: Simple Icons `claude` (CC0 1.0), viewBox 0 0 24 24, brand color `#D97757`.
