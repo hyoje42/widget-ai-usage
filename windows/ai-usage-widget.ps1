@@ -1396,6 +1396,8 @@ function Update-ServiceView {
             $view["Label$win"].Text = ('{0}%' -f [int]$remaining)
         }
         $fill.Background = Get-BarBrush -Remaining $remaining -Fresh $fresh
+        # An empty bar cannot show its warning colour.
+        $view["Label$win"].Foreground = $(if ($fresh -and $null -ne $remaining -and $remaining -eq 0) { $script:Colors.Bad } else { $script:Colors.Text })
 
         $reset = Get-ResetPresentation -ResetsAt $resetAt -Fresh $fresh -Window $win
         $rt = $view["Reset$win"]

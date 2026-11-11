@@ -135,3 +135,5 @@ cd /mnt/c && powershell.exe -NoProfile -Command 'Add-Type -AssemblyName System.D
 - To see startup errors, run `-Command 'try { & "<path>" } catch { $_.ScriptStackTrace; $_.Exception.Message }'`; `-File` loses line numbers.
 - Log: `widget.log` in the install dir. When healthy, it gets one `fetch claude=ok codex=ok` line per refresh interval.
 - After any change, at minimum confirm that `-FetchOnly` returns `ok` for both services.
+- Zero-remaining percentage text (2026-11-11): fresh 0% is red; Windows runtime verification is pending
+  because the Linux development environment has no Windows PowerShell/WPF.

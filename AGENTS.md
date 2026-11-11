@@ -91,6 +91,7 @@ malformed, **show an error state** instead of throwing.
 
 Displayed value: remaining percent = `100 - used%`. An absent window in a fresh response shows `N/A` on a
 steel-blue striped track (`$script:NotApplicableHatch`), never an empty bar that reads as 0% left.
+For a fresh response with 0% remaining, colour the widget's percentage text red, since the empty bar has no visible fill.
 
 ### Logos
 - Claude: Simple Icons `claude` (CC0 1.0), viewBox 0 0 24 24, brand color `#D97757`.
